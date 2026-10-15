@@ -10,7 +10,7 @@ import {
 import { isRetryableFailure } from "./shared/retryable.mjs";
 import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 import {
-  captureEvent,
+  captureEventDetails,
   isOpenVikingPluginMessage,
   pluginMessage,
   promptText,
@@ -56,6 +56,8 @@ export class OpenVikingRuntime {
       initializationRetryable: false,
       hasPendingWrites: false,
       pendingCreatedAt: 0,
+      segmentSequence: 0,
+      currentSegment: null,
       disposing: null,
     };
     this.states.set(session.id, state);
@@ -150,31 +152,71 @@ export class OpenVikingRuntime {
 
   capture(session, event) {
     const state = this.stateFor(session);
-    if (!isCaptureEnabled(state.config)) return;
-    const payload = captureEvent(event, state.config, state.toolNames);
-    if (!payload) return;
+    const captured = captureEventDetails(event, state.config, state.toolNames);
+    if (!captured.payload) return;
+
+    const segment = this.currentSegment(state);
+    const coverage = this.addCoveredEvent(session, segment, event, captured.truncated);
+    if (isUnattributedIsolatedSession(state.config)) {
+      coverage.captureStatus = "pending_project";
+      segment.pendingReason = "project_unassigned";
+      this.emitSegmentTrace(state, segment);
+      return;
+    }
+    if (!isCaptureEnabled(state.config)) {
+      coverage.captureStatus = "disabled";
+      segment.pendingReason = "capture_disabled";
+      this.emitSegmentTrace(state, segment);
+      return;
+    }
+
+    coverage.captureStatus = "pending";
+    this.emitSegmentTrace(state, segment);
     this.enqueueWrite(state, async () => {
-      if (state.hasPendingWrites) {
-        await this.enqueuePendingMessage(state, payload);
-        return;
-      }
-      if (!state.ready && !(await this.ensureState(state)).ready) {
-        if (state.initializationRetryable) {
-          await this.enqueuePendingMessage(state, payload);
+      try {
+        if (state.hasPendingWrites) {
+          const queued = await this.enqueuePendingMessage(state, captured.payload);
+          coverage.captureStatus = queued.ok ? "pending_queue" : "failed";
+          this.emitSegmentTrace(state, segment);
+          return;
         }
-        return;
-      }
-      if (state.hasPendingWrites) {
-        await this.enqueuePendingMessage(state, payload);
-        return;
-      }
-      const response = await this.client.addMessage(
-        state.ovSessionId,
-        payload,
-        state.config.peerId,
-      );
-      if (isRetryableFailure(response)) {
-        await this.enqueuePendingMessage(state, payload);
+        if (!state.ready && !(await this.ensureState(state)).ready) {
+          if (state.initializationRetryable) {
+            const queued = await this.enqueuePendingMessage(state, captured.payload);
+            coverage.captureStatus = queued.ok ? "pending_queue" : "failed";
+          } else {
+            coverage.captureStatus = "failed";
+            segment.pendingReason = "session_initialization_failed";
+          }
+          this.emitSegmentTrace(state, segment);
+          return;
+        }
+        if (state.hasPendingWrites) {
+          const queued = await this.enqueuePendingMessage(state, captured.payload);
+          coverage.captureStatus = queued.ok ? "pending_queue" : "failed";
+          this.emitSegmentTrace(state, segment);
+          return;
+        }
+        const response = await this.client.addMessage(
+          state.ovSessionId,
+          captured.payload,
+          state.config.peerId,
+        );
+        if (response.ok) {
+          coverage.captureStatus = "captured";
+        } else if (isRetryableFailure(response)) {
+          const queued = await this.enqueuePendingMessage(state, captured.payload);
+          coverage.captureStatus = queued.ok ? "pending_queue" : "failed";
+        } else {
+          coverage.captureStatus = "failed";
+          segment.pendingReason = response.error?.code || "capture_write_failed";
+        }
+        this.emitSegmentTrace(state, segment);
+      } catch (error) {
+        coverage.captureStatus = "failed";
+        segment.pendingReason = "capture_write_error";
+        this.emitSegmentTrace(state, segment);
+        throw error;
       }
     });
   }
@@ -185,31 +227,283 @@ export class OpenVikingRuntime {
     const boundary = event.type === "compaction/start";
     if (event.type !== "turn/end" && !boundary) return;
     const state = this.stateFor(session);
+    const segment = state.currentSegment;
+    if (isUnattributedIsolatedSession(state.config)) {
+      if (segment) {
+        segment.pendingReason = "project_unassigned";
+        this.emitSegmentTrace(state, segment);
+      }
+      return;
+    }
     if (!isCaptureEnabled(state.config)) return;
     this.enqueueWrite(state, async () => {
-      if (state.hasPendingWrites) return;
-      if (!state.ready && !(await this.ensureState(state)).ready) return;
+      if (state.hasPendingWrites) {
+        if (segment) {
+          segment.pendingReason = "capture_queue_not_replayed";
+          this.emitSegmentTrace(state, segment);
+        }
+        return;
+      }
+      if (!state.ready && !(await this.ensureState(state)).ready) {
+        if (segment) {
+          segment.pendingReason = "session_initialization_failed";
+          this.emitSegmentTrace(state, segment);
+        }
+        return;
+      }
       if (!boundary) {
         const metadata = await this.client.getSession(
           state.ovSessionId,
           state.config.peerId,
         );
-        if (Number(metadata?.pending_tokens || 0) < state.config.commitTokenThreshold) return;
+        const pendingTokens = Number(metadata?.pending_tokens || 0);
+        if (pendingTokens < state.config.commitTokenThreshold) {
+          if (segment) {
+            segment.trigger = "threshold_check";
+            segment.commitCheck = {
+              status: "not_reached",
+              pendingTokens,
+              threshold: Number(state.config.commitTokenThreshold) || 0,
+            };
+            this.emitSegmentTrace(state, segment);
+          }
+          return;
+        }
       }
-      const response = await this.client.commitSession(
-        state.ovSessionId,
-        state.config.peerId,
-      );
-      this.log(boundary ? "compaction_commit" : "commit", {
-        sessionId: state.ovSessionId,
-        ok: response.ok,
-        trace_id: response.result?.trace_id || response.traceId,
-        error: response.ok ? undefined : response.error?.message || response.error?.code,
-      });
-      if (isRetryableFailure(response)) {
-        await this.enqueueFinalCommit(state, { keep_recent_count: 0 });
-      }
+      await this.commitSegment(state, segment, boundary ? "compaction" : "threshold");
     });
+  }
+
+  currentSegment(state) {
+    if (state.currentSegment) return state.currentSegment;
+    state.segmentSequence += 1;
+    state.currentSegment = {
+      segmentId: `${state.dshSessionId}:${state.segmentSequence}`,
+      projectId: state.config.peerId || null,
+      eventCoverage: [],
+      captureStatus: "pending",
+      pendingReason: null,
+      trigger: null,
+      commitCheck: null,
+      archive: { status: "pending" },
+      extraction: { status: "not_started" },
+    };
+    return state.currentSegment;
+  }
+
+  addCoveredEvent(session, segment, event, truncated) {
+    const reference = eventReference(session, event);
+    const hasStableReference = reference.eventId !== null || reference.eventSequence !== null;
+    const existing = hasStableReference
+      ? segment.eventCoverage.find(item => (
+          (reference.eventId && item.eventId === reference.eventId)
+          || (reference.eventId === null && item.eventSequence === reference.eventSequence)
+        ))
+      : null;
+    if (existing) return existing;
+    const coverage = {
+      ...reference,
+      eventType: String(event?.type || "unknown"),
+      captureStatus: "pending",
+      truncated: Boolean(truncated),
+    };
+    segment.eventCoverage.push(coverage);
+    if (truncated) segment.coverageStatus = "truncated";
+    return coverage;
+  }
+
+  emitSegmentTrace(state, segment) {
+    this.log("segment_trace", {
+      projectId: segment.projectId,
+      dshSessionId: state.dshSessionId,
+      openVikingSessionId: state.ovSessionId,
+      segmentId: segment.segmentId,
+      trigger: segment.trigger,
+      coveredEventIds: segment.eventCoverage.map(item => item.eventId).filter(Boolean),
+      eventCoverage: segment.eventCoverage.map(item => ({ ...item })),
+      coverageStatus: segment.coverageStatus || "observed",
+      capture: {
+        status: summarizeCaptureStatus(segment.eventCoverage),
+        capturedEvents: segment.eventCoverage.filter(item => item.captureStatus === "captured").length,
+        pendingEvents: segment.eventCoverage.filter(item => item.captureStatus === "pending" || item.captureStatus === "pending_queue").length,
+        truncatedEvents: segment.eventCoverage.filter(item => item.truncated).length,
+      },
+      commitCheck: segment.commitCheck ? { ...segment.commitCheck } : null,
+      pendingReason: segment.pendingReason,
+      archive: { ...segment.archive },
+      extraction: { ...segment.extraction },
+    });
+  }
+
+  async commitSegment(state, segment, trigger, options = {}) {
+    if (segment) {
+      segment.trigger = trigger;
+      segment.pendingReason = null;
+      segment.archive = { status: "requesting" };
+      this.emitSegmentTrace(state, segment);
+    }
+    const response = await this.client.commitSession(
+      state.ovSessionId,
+      state.config.peerId,
+      options,
+    );
+    this.log(trigger === "compaction" ? "compaction_commit" : trigger === "session_close" ? "shutdown_commit" : "commit", {
+      sessionId: state.ovSessionId,
+      ok: response.ok,
+      trace_id: response.result?.trace_id || response.traceId,
+      error: response.ok ? undefined : response.error?.code,
+    });
+    if (segment) {
+      if (response.ok) {
+        const result = response.result || {};
+        segment.archive = {
+          status: result.archive_uri ? "confirmed" : "accepted_unconfirmed",
+          uri: result.archive_uri || null,
+        };
+        const taskId = result.task_id || null;
+        segment.extraction = taskId
+          ? { status: "pending", taskId, taskStatus: "pending" }
+          : { status: "not_started", reason: "task_id_missing" };
+        this.emitSegmentTrace(state, segment);
+        if (state.currentSegment === segment) state.currentSegment = null;
+        if (taskId) {
+          void this.observeExtractionTask(state, segment, taskId).catch(error => {
+            segment.extraction = {
+              ...segment.extraction,
+              status: "unobserved",
+              reason: "task_observation_error",
+              errorName: error instanceof Error ? error.name : "Error",
+            };
+            this.emitSegmentTrace(state, segment);
+          });
+        }
+      } else {
+        segment.archive = {
+          status: isRetryableFailure(response) ? "pending_retry" : "failed",
+          errorCode: response.error?.code || null,
+        };
+        segment.extraction = { status: "not_started" };
+        this.emitSegmentTrace(state, segment);
+      }
+    }
+    if (isRetryableFailure(response)) {
+      await this.enqueueFinalCommit(state, { keep_recent_count: 0 });
+    }
+    return response;
+  }
+
+  async observeExtractionTask(state, segment, taskId) {
+    const timeoutMs = Number(this.config.extractionTrackingTimeoutMs) || 300000;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const response = await this.client.fetchJSON(
+        `/api/v1/tasks/${encodeURIComponent(taskId)}`,
+        {},
+        { timeoutMs: Math.min(10000, Number(state.config.requestTimeoutMs) || 10000), actorPeerId: state.config.peerId },
+      );
+      if (!response.ok) {
+        if (isRetryableFailure(response)) {
+          segment.extraction = { ...segment.extraction, status: "pending", observationError: response.error?.code || "retryable_http_error" };
+          this.emitSegmentTrace(state, segment);
+          await wait(250);
+          continue;
+        }
+        segment.extraction = {
+          ...segment.extraction,
+          status: "unobserved",
+          reason: "task_lookup_failed",
+          errorCode: response.error?.code || null,
+        };
+        this.emitSegmentTrace(state, segment);
+        return;
+      }
+
+      const task = response.result || {};
+      segment.extraction = { ...segment.extraction, taskStatus: task.status || "unknown" };
+      if (["pending", "running", "cancelling"].includes(task.status)) {
+        this.emitSegmentTrace(state, segment);
+        await wait(250);
+        continue;
+      }
+      if (task.status === "failed") {
+        segment.extraction = { ...segment.extraction, status: "failed", errorCode: task.error_code || null };
+        this.emitSegmentTrace(state, segment);
+        return;
+      }
+      if (task.status === "cancelled") {
+        segment.extraction = { ...segment.extraction, status: "cancelled" };
+        this.emitSegmentTrace(state, segment);
+        return;
+      }
+      if (task.status !== "completed") {
+        segment.extraction = { ...segment.extraction, status: "unobserved", reason: "unknown_task_status" };
+        this.emitSegmentTrace(state, segment);
+        return;
+      }
+
+      const result = task.result || {};
+      if (result.archive_uri && segment.archive.status !== "confirmed") {
+        segment.archive = { status: "confirmed", uri: result.archive_uri };
+      }
+      if (isExtractionDisabled(result)) {
+        segment.extraction = { status: "disabled", taskId, taskStatus: "completed", reason: result.memory_extraction?.skip_reason || "provider_disabled" };
+        this.emitSegmentTrace(state, segment);
+        return;
+      }
+      if (!result.memory_diff_uri) {
+        segment.extraction = {
+          status: "completed_unverified",
+          taskId,
+          taskStatus: "completed",
+          reason: "memory_diff_missing",
+          memoriesExtracted: result.memories_extracted ?? null,
+        };
+        this.emitSegmentTrace(state, segment);
+        return;
+      }
+      const diffResponse = await this.client.fetchJSON(
+        `/api/v1/content/read?uri=${encodeURIComponent(result.memory_diff_uri)}`,
+        {},
+        { timeoutMs: Math.min(10000, Number(state.config.requestTimeoutMs) || 10000), actorPeerId: state.config.peerId },
+      );
+      if (!diffResponse.ok) {
+        segment.extraction = {
+          status: "completed_unverified",
+          taskId,
+          taskStatus: "completed",
+          reason: "memory_diff_unreadable",
+          errorCode: diffResponse.error?.code || null,
+        };
+        this.emitSegmentTrace(state, segment);
+        return;
+      }
+      const operations = countMemoryOperations(diffResponse.result);
+      if (!operations) {
+        segment.extraction = {
+          status: "completed_unverified",
+          taskId,
+          taskStatus: "completed",
+          reason: "memory_diff_invalid",
+          memoryDiffUri: result.memory_diff_uri,
+        };
+        this.emitSegmentTrace(state, segment);
+        return;
+      }
+      segment.extraction = {
+        status: operations.adds + operations.updates + operations.deletes > 0
+          ? "completed_non_empty"
+          : "completed_empty",
+        taskId,
+        taskStatus: "completed",
+        memoryDiffUri: result.memory_diff_uri,
+        operations,
+        memoriesExtracted: result.memories_extracted ?? null,
+      };
+      this.emitSegmentTrace(state, segment);
+      return;
+    }
+    segment.extraction = { ...segment.extraction, status: "pending", reason: "task_observation_timeout" };
+    this.emitSegmentTrace(state, segment);
   }
 
   dispose(session) {
@@ -218,26 +512,35 @@ export class OpenVikingRuntime {
     if (state.disposing) return state.disposing;
     state.disposing = (async () => {
       this.enqueueWrite(state, async () => {
+        const segment = state.currentSegment;
+        if (isUnattributedIsolatedSession(state.config)) {
+          if (segment) {
+            segment.pendingReason = "project_unassigned";
+            this.emitSegmentTrace(state, segment);
+          }
+          return;
+        }
         if (!isCaptureEnabled(state.config)) return;
         const commitPayload = { keep_recent_count: 0 };
         if (state.hasPendingWrites) {
           await this.enqueueFinalCommit(state, commitPayload);
+          if (segment) {
+            segment.archive = { status: "pending_queue" };
+            segment.pendingReason = "capture_queue_not_replayed";
+            this.emitSegmentTrace(state, segment);
+          }
           return;
         }
-        if (!state.ready && !(await this.ensureState(state)).ready) return;
-        const response = await this.client.commitSession(
-          state.ovSessionId,
-          state.config.peerId,
-          { timeoutMs: Math.min(3000, Number(state.config.requestTimeoutMs) || 3000) },
-        );
-        this.log("shutdown_commit", {
-          sessionId: state.ovSessionId,
-          ok: response.ok,
-          trace_id: response.result?.trace_id || response.traceId,
-        });
-        if (isRetryableFailure(response)) {
-          await this.enqueueFinalCommit(state, commitPayload);
+        if (!state.ready && !(await this.ensureState(state)).ready) {
+          if (segment) {
+            segment.pendingReason = "session_initialization_failed";
+            this.emitSegmentTrace(state, segment);
+          }
+          return;
         }
+        await this.commitSegment(state, segment, "session_close", {
+          timeoutMs: Math.min(3000, Number(state.config.requestTimeoutMs) || 3000),
+        });
       });
       try {
         await state.writes;
@@ -426,4 +729,70 @@ function hasStartupProfile(agent) {
 function isStartupProfile(message) {
   return isOpenVikingPluginMessage(message)
     && message.source.form === "instructions";
+}
+
+function eventReference(session, event) {
+  const eventId = event?.id == null || String(event.id).trim() === ""
+    ? null
+    : String(event.id);
+  const events = Array.isArray(session?.events) ? session.events : [];
+  let eventSequence = events.indexOf(event);
+  if (eventSequence < 0 && eventId !== null) {
+    eventSequence = events.findIndex(item => String(item?.id ?? "") === eventId);
+  }
+  return {
+    eventId,
+    eventSequence: eventSequence >= 0 ? eventSequence : null,
+  };
+}
+
+function summarizeCaptureStatus(eventCoverage) {
+  const statuses = eventCoverage.map(item => item.captureStatus);
+  if (statuses.length === 0) return "no_events";
+  if (statuses.includes("failed")) return "partial_failure";
+  if (statuses.includes("pending_project")) return "pending_project";
+  if (statuses.includes("pending") || statuses.includes("pending_queue")) return "pending";
+  if (statuses.every(status => status === "disabled")) return "disabled";
+  if (statuses.every(status => status === "captured")) return "captured";
+  return "partial";
+}
+
+function isUnattributedIsolatedSession(config) {
+  return Boolean(config?.memoryIsolation) && !String(config?.peerId || "").trim();
+}
+
+function isExtractionDisabled(result) {
+  const extraction = result?.memory_extraction || result?.extraction || {};
+  const skipReason = extraction.skip_reason || result?.extraction_skip_reason;
+  return extraction.enabled === false
+    || extraction.status === "disabled"
+    || (Array.isArray(result?.effective_memory_types) && result.effective_memory_types.length === 0)
+    || ["disabled", "provider_disabled", "memory_extraction_disabled"].includes(skipReason);
+}
+
+function countMemoryOperations(content) {
+  let diff = content;
+  if (typeof diff === "string") {
+    try {
+      diff = JSON.parse(diff);
+    } catch {
+      return null;
+    }
+  }
+  if (!diff || typeof diff !== "object" || !diff.operations || typeof diff.operations !== "object") {
+    return null;
+  }
+  const operations = diff.operations;
+  if (!["adds", "updates", "deletes"].every(key => Array.isArray(operations[key]))) {
+    return null;
+  }
+  return {
+    adds: operations.adds.length,
+    updates: operations.updates.length,
+    deletes: operations.deletes.length,
+  };
+}
+
+function wait(timeoutMs) {
+  return new Promise(resolve => setTimeout(resolve, timeoutMs));
 }

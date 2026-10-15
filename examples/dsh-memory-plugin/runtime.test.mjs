@@ -484,6 +484,7 @@ test("syncTurns false sends nothing: no capture, no commit, no dispose flush, no
   await enqueue("addMessage", "dsh-earlier", { content: "queued while capture was on" });
 
   const writes = [];
+  const traces = [];
   const runtime = new OpenVikingRuntime({
     async healthResult() {
       return { ok: true };
@@ -506,7 +507,7 @@ test("syncTurns false sends nothing: no capture, no commit, no dispose flush, no
       writes.push("commitSession");
       return { ok: true };
     },
-  }, { ...config(), syncTurns: false }, { debug() {} });
+  }, { ...config(), syncTurns: false }, traceLogger(traces));
   const session = { id: "sync-off", header: { cwd: "/workspace" } };
 
   runtime.capture(session, userEvent("Never sent."));
@@ -515,6 +516,9 @@ test("syncTurns false sends nothing: no capture, no commit, no dispose flush, no
   // the toggle takes the replay out of it without taking the reads with it.
   assert.equal((await runtime.initialize({ session })).ready, true);
   await runtime.flush(session);
+  assert.equal(traces.at(-1).capture.status, "disabled");
+  assert.equal(traces.at(-1).archive.status, "pending");
+  assert.equal(traces.at(-1).extraction.status, "not_started");
   await runtime.dispose(session);
 
   assert.deepEqual(writes, []);
@@ -571,6 +575,252 @@ function userEvent(text) {
       role: "user",
       content: [{ type: "text", text }],
       source: { kind: "user" },
+    },
+  };
+}
+
+test("runtime reports captured coverage, archive confirmation, and observed extraction separately", async () => {
+  const archiveUri = "viking://~/memories/sessions/man351-archive";
+  const memoryDiffUri = `${archiveUri}/memory_diff.json`;
+  const taskStatuses = [];
+  const traceUpdates = [];
+  let taskReadCount = 0;
+  const runtime = new OpenVikingRuntime({
+    async addMessage() {
+      return { ok: true };
+    },
+    async commitSession() {
+      return {
+        ok: true,
+        result: { trace_id: "trace-synthetic", task_id: "task-synthetic", archive_uri: archiveUri },
+      };
+    },
+    async fetchJSON(path) {
+      if (path.startsWith("/api/v1/tasks/")) {
+        taskReadCount += 1;
+        const status = taskReadCount === 1 ? "running" : "completed";
+        taskStatuses.push(status);
+        return {
+          ok: true,
+          result: {
+            task_id: "task-synthetic",
+            task_type: "session_commit",
+            resource_id: "dsh-man351-session",
+            status,
+            ...(status === "completed" ? {
+              result: { archive_uri: archiveUri, memory_diff_uri: memoryDiffUri, memories_extracted: 1 },
+            } : {}),
+          },
+        };
+      }
+      if (path.startsWith("/api/v1/content/read")) {
+        return {
+          ok: true,
+          result: JSON.stringify({ operations: { adds: [{ uri: "viking://~/memories/events/man351.md" }], updates: [], deletes: [] } }),
+        };
+      }
+      assert.fail(`unexpected OpenViking request: ${path}`);
+    },
+  }, { ...config(), peerId: "man351-synthetic-project", explicitPeerId: "man351-synthetic-project" }, {
+    debug(message) {
+      const prefix = "[openviking:dsh] segment_trace ";
+      if (message.startsWith(prefix)) traceUpdates.push(JSON.parse(message.slice(prefix.length)));
+    },
+  });
+  const session = { id: "man351-session", header: { cwd: "/synthetic/project" } };
+  runtime.stateFor(session).ready = true;
+
+  runtime.capture(session, { ...userEvent("MAN351_FACT_fixturealpha happened in the synthetic project."), id: "event-1" });
+  runtime.maybeCommit(session, { id: "compaction-1", type: "compaction/start" });
+  await runtime.flush(session);
+  await waitUntil(() => traceUpdates.at(-1)?.extraction?.status === "completed_non_empty");
+
+  const trace = traceUpdates.at(-1);
+  assert.equal(trace.projectId, "man351-synthetic-project");
+  assert.equal(trace.dshSessionId, session.id);
+  assert.deepEqual(trace.coveredEventIds, ["event-1"]);
+  assert.equal(trace.archive.status, "confirmed");
+  assert.equal(trace.archive.uri, archiveUri);
+  assert.equal(trace.extraction.status, "completed_non_empty");
+  assert.deepEqual(trace.extraction.operations, { adds: 1, updates: 0, deletes: 0 });
+  assert.ok(taskStatuses.includes("running"), "an accepted task ID is not a completed extraction");
+  assert.ok(taskStatuses.includes("completed"));
+});
+
+async function waitUntil(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.fail(`condition was not met within ${timeoutMs}ms`);
+}
+
+test("runtime keeps below-threshold and handoff segments pending until session close", async () => {
+  const traces = [];
+  let commits = 0;
+  const runtime = new OpenVikingRuntime({
+    async addMessage() { return { ok: true }; },
+    async getSession() { return { pending_tokens: 5 }; },
+    async commitSession() {
+      commits += 1;
+      return { ok: true, result: { archive_uri: "viking://~/sessions/close-archive" } };
+    },
+  }, {
+    ...config(),
+    peerId: "man351-project",
+    explicitPeerId: "man351-project",
+    commitTokenThreshold: 100,
+  }, traceLogger(traces));
+  const session = { id: "threshold-session", header: { cwd: "/project" } };
+  runtime.stateFor(session).ready = true;
+
+  runtime.capture(session, { ...userEvent("A captured event below the threshold."), id: "event-threshold" });
+  runtime.maybeCommit(session, { type: "turn/end" });
+  await runtime.flush(session);
+
+  const belowThreshold = traces.at(-1);
+  assert.equal(belowThreshold.commitCheck.status, "not_reached");
+  assert.equal(belowThreshold.archive.status, "pending");
+  assert.equal(belowThreshold.extraction.status, "not_started");
+  assert.equal(commits, 0);
+
+  runtime.maybeCommit(session, { type: "session/handoff" });
+  await runtime.flush(session);
+  assert.equal(commits, 0, "a handoff event must not archive the mother session");
+
+  await runtime.dispose(session);
+  const closed = traces.at(-1);
+  assert.equal(commits, 1);
+  assert.equal(closed.trigger, "session_close");
+  assert.equal(closed.archive.status, "confirmed");
+  assert.equal(closed.extraction.status, "not_started");
+});
+
+test("runtime gives later captured events a separate segment and marks truncation", async () => {
+  const traces = [];
+  let commits = 0;
+  const runtime = new OpenVikingRuntime({
+    async addMessage() { return { ok: true }; },
+    async commitSession() {
+      commits += 1;
+      return { ok: true, result: { archive_uri: `viking://~/sessions/segment-${commits}` } };
+    },
+  }, {
+    ...config(),
+    peerId: "man351-project",
+    explicitPeerId: "man351-project",
+    captureMaxLength: 32,
+  }, traceLogger(traces));
+  const session = { id: "multi-segment", header: { cwd: "/project" } };
+  runtime.stateFor(session).ready = true;
+
+  runtime.capture(session, { ...userEvent("This invented conversation event is deliberately much longer than the capture limit."), id: "event-long" });
+  await runtime.flush(session);
+  const firstObserved = traces.at(-1);
+  assert.equal(firstObserved.coverageStatus, "truncated");
+  assert.equal(firstObserved.eventCoverage[0].truncated, true);
+  runtime.maybeCommit(session, { type: "compaction/start" });
+  await runtime.flush(session);
+
+  runtime.capture(session, { ...userEvent("A second independently captured segment."), id: "event-second" });
+  await runtime.flush(session);
+  runtime.maybeCommit(session, { type: "compaction/start" });
+  await runtime.flush(session);
+
+  const segmentTraces = traces.filter(item => item.archive.status === "confirmed");
+  assert.equal(commits, 2);
+  assert.deepEqual(segmentTraces.map(item => item.coveredEventIds), [["event-long"], ["event-second"]]);
+  assert.notEqual(segmentTraces[0].segmentId, segmentTraces[1].segmentId);
+});
+
+test("runtime distinguishes disabled, failed, and completed-empty extraction", async () => {
+  const scenarios = [
+    ["disabled", {
+      status: "completed",
+      result: { memory_extraction: { enabled: false, skip_reason: "provider_disabled" } },
+    }, null, "disabled"],
+    ["failed", { status: "failed", error_code: "PROVIDER_UNAVAILABLE" }, null, "failed"],
+    ["empty", {
+      status: "completed",
+      result: { memory_diff_uri: "viking://~/sessions/empty/memory_diff.json", memories_extracted: {} },
+    }, { operations: { adds: [], updates: [], deletes: [] } }, "completed_empty"],
+    ["unverified", { status: "completed", result: { memories_extracted: {} } }, null, "completed_unverified"],
+    ["invalid-diff", {
+      status: "completed",
+      result: { memory_diff_uri: "viking://~/sessions/invalid/memory_diff.json" },
+    }, "not-json", "completed_unverified"],
+    ["partial-diff", {
+      status: "completed",
+      result: { memory_diff_uri: "viking://~/sessions/partial/memory_diff.json" },
+    }, { operations: {} }, "completed_unverified"],
+  ];
+
+  for (const [name, task, diff, expectedStatus] of scenarios) {
+    const traces = [];
+    const runtime = new OpenVikingRuntime({
+      async addMessage() { return { ok: true }; },
+      async commitSession() {
+        return { ok: true, result: { task_id: `task-${name}`, archive_uri: `viking://~/sessions/${name}` } };
+      },
+      async fetchJSON(path) {
+        if (path.startsWith("/api/v1/tasks/")) return { ok: true, result: task };
+        if (path.startsWith("/api/v1/content/read")) return { ok: true, result: JSON.stringify(diff) };
+        assert.fail(`unexpected OpenViking request: ${path}`);
+      },
+    }, {
+      ...config(),
+      peerId: "man351-project",
+      explicitPeerId: "man351-project",
+    }, traceLogger(traces));
+    const session = { id: `scenario-${name}`, header: { cwd: "/project" } };
+    runtime.stateFor(session).ready = true;
+
+    runtime.capture(session, { ...userEvent(`Scenario ${name} covers one synthetic event.`), id: `event-${name}` });
+    runtime.maybeCommit(session, { type: "compaction/start" });
+    await runtime.flush(session);
+    await waitUntil(() => traces.at(-1)?.extraction?.status === expectedStatus);
+
+    const trace = traces.at(-1);
+    assert.equal(trace.extraction.status, expectedStatus, name);
+    assert.equal(trace.archive.status, "confirmed", name);
+    if (name === "empty") assert.deepEqual(trace.extraction.operations, { adds: 0, updates: 0, deletes: 0 });
+  }
+});
+
+test("isolated capture without a project remains pending and sends nothing", async () => {
+  const traces = [];
+  let sends = 0;
+  const runtime = new OpenVikingRuntime({
+    async addMessage() { sends += 1; return { ok: true }; },
+    async commitSession() { sends += 1; return { ok: true }; },
+  }, {
+    ...config(),
+    peerId: "",
+    explicitPeerId: "",
+    memoryIsolation: { candidate: { account: "unattributed" } },
+  }, traceLogger(traces));
+  const session = { id: "unattributed-session", header: { cwd: "/unknown" } };
+  runtime.stateFor(session).ready = true;
+
+  runtime.capture(session, { ...userEvent("This event has no project attribution."), id: "event-unattributed" });
+  runtime.maybeCommit(session, { type: "compaction/start" });
+  await runtime.flush(session);
+
+  const trace = traces.at(-1);
+  assert.equal(sends, 0);
+  assert.equal(trace.projectId, null);
+  assert.equal(trace.capture.status, "pending_project");
+  assert.equal(trace.pendingReason, "project_unassigned");
+  assert.equal(trace.archive.status, "pending");
+  assert.equal(trace.extraction.status, "not_started");
+});
+
+function traceLogger(traces) {
+  return {
+    debug(message) {
+      const prefix = "[openviking:dsh] segment_trace ";
+      if (message.startsWith(prefix)) traces.push(JSON.parse(message.slice(prefix.length)));
     },
   };
 }

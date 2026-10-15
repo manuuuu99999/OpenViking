@@ -9,8 +9,10 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import secrets
 import socket
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 ROOT = Path(os.environ.get("MAN350_SYNTHETIC_ROOT", "")).resolve()
@@ -72,9 +74,23 @@ VLMConfig.is_available = lambda self: True
 
 async def synthetic_completion(self, prompt=None, thinking=False, **kwargs):
     if "messages" in kwargs:
-        # Extraction is intentionally a no-op: this fixture checks capture and
-        # isolation, not whether a language model invents a durable memory.
-        return "sdk.commit()"
+        # The server still runs its real extraction pipeline; only its external
+        # model response is controlled so the test always observes one candidate.
+        messages = json.dumps(kwargs["messages"], ensure_ascii=False, default=str)
+        match = re.search(r"MAN351_FACT_[a-f0-9]{32}", messages)
+        if match is None:
+            fact_marker = "MAN350_FACT_fixturealpha"
+            event_name = "man350_fixture_delivery"
+        else:
+            fact_marker = match.group(0)
+            event_name = f"man351_fixture_delivery_{fact_marker.removeprefix('MAN351_FACT_')}"
+        return (
+            "sdk.create_events("
+            f"event_name='{event_name}', "
+            "goal='record synthetic delivery', "
+            f"summary='{fact_marker} happened in the synthetic project.', "
+            "ranges='0')"
+        )
     return "# Synthetic test summary\n\nInvented content only."
 
 
@@ -129,10 +145,21 @@ async def main():
             response.raise_for_status()
             if response.json().get("status") != "ok":
                 raise RuntimeError("Synthetic server did not report healthy")
+        server_version = package_version("openviking")
         (run_dir / "identities.json").write_text(
-            json.dumps({"url": base_url, "keys": identities}, indent=2), encoding="utf-8"
+            json.dumps({
+                "url": base_url,
+                "server_version": server_version,
+                "extraction_fixture": "man351-deterministic-event-v1",
+                "keys": identities,
+            }, indent=2),
+            encoding="utf-8",
         )
-        print(f"Synthetic OpenViking ready at {base_url}; identities: {run_dir / 'identities.json'}", flush=True)
+        print(
+            f"Synthetic OpenViking {server_version} ready at {base_url}; "
+            f"identities: {run_dir / 'identities.json'}",
+            flush=True,
+        )
         if args.smoke:
             return
         await task

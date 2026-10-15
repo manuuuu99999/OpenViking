@@ -314,7 +314,7 @@ npm run check   # syntax check every shipped module + package/PLUGIN_VERSION agr
 npm test        # node --test *.test.mjs — runs in the repo's PR workflow
 ```
 
-### Reproduce MAN-350 without touching active memory
+### Reproduce MAN-350 capture and MAN-351 extraction in isolation
 
 Use a separate Python environment with the official `openviking==0.5.0` wheel
 (`python -m venv <isolated-venv>` and `<isolated-venv>/Scripts/python -m pip
@@ -323,22 +323,29 @@ named `ov-man350-test` **outside** the active OpenViking data and DSH profile.
 Set `MAN350_SYNTHETIC_ROOT` to its absolute path, then start
 `<isolated-venv>/Scripts/python -u test-fixture/serve_synthetic.py` from this
 package directory. On other platforms use `<isolated-venv>/bin/python`.
-Wait for `Synthetic OpenViking ready at ...; identities: ...`; no real keys or
-models are used. Only the embedding/text models are deterministic substitutes;
-synthetic long-term extraction produces no new memories. The installed
-OpenViking server handles storage, identities, HTTP routes and authorization.
-This test proves captured session content and access boundaries, **not** real
-model-driven memory extraction. It also forces the context endpoint unavailable
-for one approved-only fallback lookup and checks that a historical tool result
-carries its warning in the DSH tool result. Keep the process alive for the test; set
-`MAN350_SYNTHETIC_MANIFEST` to the printed absolute `identities.json` path and
-run `node --test --test-isolation=none man350.integration.test.mjs` from this
-package directory. The test rejects a manifest outside the disposable root,
-non-loopback endpoints and the usual active-service port 1933. Stop that
-specific server process after the test and check its port closed. The
-`run-<id>` directory contains **synthetic keys**: do not commit or copy it
-into an active profile. The regular `npm test` intentionally skips this opt-in
-test instead of contacting a configured service.
+The readiness line includes the installed server version and the manifest path.
+The manifest records the version and fixture mode; it contains synthetic API
+keys and must not be committed or printed. The embedding and extraction model
+responses are deterministic substitutes, while the installed OpenViking server
+still performs storage, authorization, archival, task processing, and memory
+writes. The MAN-351 response creates one deterministic candidate from the
+unique marker in each invented conversation, through the normal extraction
+pipeline rather than a direct memory write. Trace logs include
+project/session/event IDs and states, never conversation text or credentials.
+
+Keep the process alive for the test. Set `MAN350_SYNTHETIC_ROOT` and
+`MAN350_SYNTHETIC_MANIFEST` to the fixture root and printed `identities.json`
+path, then run `node --test --test-isolation=none man350.integration.test.mjs`.
+For the MAN-351 extraction and trace check, set `MAN351_SYNTHETIC_MANIFEST` to
+the same manifest and run `node --test --test-isolation=none
+man351.integration.test.mjs`. These opt-in tests reject manifests outside the
+disposable root, non-loopback endpoints, and the usual active-service port 1933;
+they assert that the DSH event is archived, the asynchronous task yields a
+non-empty candidate diff, and approved content remains byte-for-byte unchanged.
+Stop the specific server process after the tests and verify its port is closed.
+The `run-<id>` directory contains synthetic data and keys; do not commit or
+copy it into an active profile. Regular `npm test` intentionally skips these
+opt-in tests instead of contacting a configured service.
 
 The `0.3.2` compatibility check installed the packed bundle through
 `dsh plugin add` in isolated profiles and exercised DSH `0.1.0-rc.6`,

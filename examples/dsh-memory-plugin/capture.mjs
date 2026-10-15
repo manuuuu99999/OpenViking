@@ -1,6 +1,7 @@
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import {
   extractTextFromPayload,
+  sanitizeCapturedText,
   shapeCapturePayload,
 } from "./shared/capture-utils.mjs";
 
@@ -39,24 +40,48 @@ function isSyntheticUserMessage(message) {
 }
 
 export function captureEvent(event, config, toolNames = new Map()) {
-  if (!event || typeof event !== "object") return null;
+  return captureEventDetails(event, config, toolNames).payload;
+}
+
+export function captureEventDetails(event, config, toolNames = new Map()) {
+  if (!event || typeof event !== "object") {
+    return { payload: null, truncated: false, reason: "invalid_event" };
+  }
   if (event.type === "tool/call") {
     if (config.captureToolResults === true) {
       toolNames.set(String(event.data.callId), event.data.name);
     }
-    return null;
+    return { payload: null, truncated: false, reason: "tool_call" };
   }
 
   const message = eventMessage(event);
-  if (!message) return null;
+  if (!message) return { payload: null, truncated: false, reason: "not_a_message" };
   const toolCallId = event.type === "tool/result"
     ? String(message.source?.callId || message.content?.[0]?.toolCallId || "")
     : "";
   try {
-    return captureMessage(event, message, config, toolNames);
+    const payload = captureMessage(event, message, config, toolNames);
+    return {
+      payload,
+      truncated: payload ? captureWasTruncated(message, payload, config) : false,
+      reason: payload ? "captured" : "filtered_or_unsupported",
+    };
   } finally {
     if (toolCallId) toolNames.delete(toolCallId);
   }
+}
+
+function captureWasTruncated(message, payload, config) {
+  const maxLength = Number(config.captureMaxLength) || 24000;
+  const originalText = sanitizeCapturedText(extractTextFromPayload(message, {
+    toolMaxChars: config.captureToolMaxChars,
+  }));
+  if (originalText.length <= maxLength) return false;
+  const capturedText = [
+    ...(payload.parts || []).filter(part => part?.type === "text").map(part => part.text),
+    ...(typeof payload.content === "string" ? [payload.content] : []),
+  ];
+  return capturedText.some(text => /\[truncated\]$/.test(text));
 }
 
 function captureMessage(event, message, config, toolNames) {
