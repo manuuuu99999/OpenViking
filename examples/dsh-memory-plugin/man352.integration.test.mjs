@@ -10,10 +10,20 @@ import { ToolRuntime } from "@deepseek-ai/dsh-tools";
 import { apply as applyOpenViking } from "./index.mjs";
 import { OpenVikingClient } from "./client.mjs";
 
-const SOURCE = "La conversación inventada confirma: el equipo revisa los cambios cada lunes.";
-const NEGATED_SOURCE = "La conversación inventada aclara: no es cierto que el equipo revisa los cambios cada lunes.";
-const CANDIDATE = "el equipo revisa los cambios cada lunes.";
-const CANDIDATE_URI = "viking://~/memories/entities/man352-review-cadence.md";
+const CANDIDATE_ASSERTION = "Invented observation: MAN351_FACT_a1b2c3d4 happened in the synthetic project.";
+const SOURCE = CANDIDATE_ASSERTION;
+const NEGATED_SOURCE = `It is not true that ${CANDIDATE_ASSERTION}`;
+const CANDIDATE = [
+  "# Summary",
+  CANDIDATE_ASSERTION,
+  "",
+  "# ChatLog",
+  "Project: synthetic-project",
+  `User: ${CANDIDATE_ASSERTION}`,
+  "MEMORY_FIELDS: synthetic metadata only.",
+].join("\n");
+const CANDIDATE_URI = "viking://user/candidate/peers/synthetic-project/memories/entities/man352-review-cadence.md";
+const APPROVED_CANDIDATE_URI = "viking://user/approved/peers/synthetic-project/memories/entities/man352-review-cadence.md";
 const ARCHIVE_URI = "viking://~/sessions/man352-session/archive";
 const DIFF_URI = "viking://~/sessions/man352-session/memory_diff.json";
 const SECRET = ["sk_", "live_", "synthetic_test_value_12345"].join("");
@@ -34,7 +44,7 @@ const originalStateDir = process.env.OPENVIKING_STATE_DIR;
 const originalPendingDir = process.env.OPENVIKING_PENDING_DIR;
 const originalFetch = globalThis.fetch;
 
-test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archivo", async () => {
+test("DSH prepara y abre una propuesta con formato real usando respuestas simuladas", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "man352-proposals-"));
   process.env.OPENVIKING_STATE_DIR = stateDir;
   process.env.OPENVIKING_PENDING_DIR = join(stateDir, "pending");
@@ -50,6 +60,8 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     { archiveUri: MISSING_ARCHIVE_URI, diffUri: DIFF_URI, candidateUri: CANDIDATE_URI },
   ];
   let approvedPrevious = "";
+  let denyCandidateUriForApproved = false;
+  let candidateContent = CANDIDATE;
   let missingArchiveMessage = "Archive path was not found.";
   globalThis.fetch = async (url, init = {}) => {
     const parsed = new URL(url);
@@ -108,11 +120,16 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
       if (uri === SECRET_DIFF_URI) {
         return response(JSON.stringify({ operations: { adds: [{ uri: SECRET_URI }], updates: [], deletes: [] } }));
       }
-      if (uri === CANDIDATE_URI) return response(CANDIDATE);
+      if (uri === CANDIDATE_URI) return response(candidateContent);
       if (uri === SECRET_URI) return response(SECRET);
     }
     if (parsed.pathname === "/api/v1/content/read" && route === "approved") {
-      if (uri === CANDIDATE_URI && approvedPrevious) return response(approvedPrevious);
+      if (uri === APPROVED_CANDIDATE_URI && approvedPrevious) return response(approvedPrevious);
+      if (uri === CANDIDATE_URI) {
+        return denyCandidateUriForApproved
+          ? response({ code: "PERMISSION_DENIED" }, 403)
+          : response({ code: "NOT_FOUND" }, 404);
+      }
       return response({ code: "NOT_FOUND" }, 404);
     }
     if (parsed.pathname === "/api/v1/content/write" && route === "approved" && method === "POST") {
@@ -199,13 +216,15 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     assert.equal(withoutFilter.value.status, "pending");
     assert.equal(withoutFilter.value.pendingReason, "secret_filter_unavailable");
 
+    denyCandidateUriForApproved = true;
     const prepared = await callTool(ctx, "openviking_review_proposal", { segmentId: SEGMENT_ID });
+    denyCandidateUriForApproved = false;
     assert.equal(prepared.isError, false, JSON.stringify(prepared.error));
     assert.equal(prepared.value.status, "reviewable", JSON.stringify(prepared.value));
     assert.equal(prepared.value.project, PROJECT_ID);
     assert.equal(prepared.value.session, SESSION_ID);
     assert.equal(prepared.value.segment, SEGMENT_ID);
-    assert.equal(prepared.value.assertion, CANDIDATE);
+    assert.equal(prepared.value.assertion, CANDIDATE_ASSERTION);
     assert.equal(prepared.value.originalPassage, SOURCE);
     assert.deepEqual(prepared.value.coverage.eventIds, [userEvent.id]);
     assert.equal(prepared.value.approvedPrevious.status, "none");
@@ -219,7 +238,8 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     assert.equal(opened.value.id, prepared.value.id);
     assert.equal(opened.value.originalPassage, SOURCE);
     const agentOutput = opened.content.map(part => part.text || "").join("\n");
-    for (const visible of [PROJECT_ID, SESSION_ID, SEGMENT_ID, CANDIDATE, SOURCE]) {
+    assert.ok(agentOutput.includes(CANDIDATE), "the agent output must preserve the complete candidate memory");
+    for (const visible of [PROJECT_ID, SESSION_ID, SEGMENT_ID, CANDIDATE_ASSERTION, SOURCE]) {
       assert.ok(agentOutput.includes(visible), `the agent output must show ${visible}`);
     }
     for (const label of [
@@ -238,8 +258,9 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     );
     assert.equal(view.card, "generic");
     assert.match(view.title, /propuesta/i);
-    assert.match(view.content, /lunes/);
-    for (const visible of [PROJECT_ID, SESSION_ID, SEGMENT_ID, CANDIDATE, SOURCE]) {
+    assert.match(view.content, /MAN351_FACT_/);
+    assert.ok(view.content.includes(CANDIDATE), "the review view must preserve the complete candidate memory");
+    for (const visible of [PROJECT_ID, SESSION_ID, SEGMENT_ID, CANDIDATE_ASSERTION, SOURCE]) {
       assert.ok(view.content.includes(visible), `the review view must show ${visible}`);
     }
     for (const label of [
@@ -252,16 +273,33 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
       /efecto previsto/i,
     ]) assert.match(view.content, label);
 
+    for (const unverifiedAssertion of [
+      "synthetic project.",
+      "The invented event was delivered to the demo project.",
+    ]) {
+      candidateContent = `# Summary\n${unverifiedAssertion}\n\n# ChatLog\n${SOURCE}`;
+      const unverified = await callTool(ctx, "openviking_review_proposal", { segmentId: SEGMENT_ID });
+      assert.equal(unverified.value.status, "pending");
+      assert.equal(unverified.value.pendingReason, "original_passage_not_verified");
+      assert.equal(unverified.value.originalPassage, "");
+    }
+    candidateContent = `# Summary\n${CANDIDATE_ASSERTION}\n\n# ChatLog\n${SOURCE}\n${SECRET}`;
+    const secretInCandidateMetadata = await callTool(ctx, "openviking_review_proposal", { segmentId: SEGMENT_ID });
+    assert.equal(secretInCandidateMetadata.value.status, "pending");
+    assert.equal(secretInCandidateMetadata.value.pendingReason, "known_secret_format_detected");
+    assert.equal(JSON.stringify(secretInCandidateMetadata.value).includes(SECRET), false);
+    candidateContent = CANDIDATE;
+
     const approvedClient = new OpenVikingClient({ ...ROUTES.approved, requestTimeoutMs: 10000 });
     const search = await approvedClient.fetchJSON("/api/v1/search/search", {
       method: "POST",
-      body: JSON.stringify({ query: CANDIDATE }),
+      body: JSON.stringify({ query: CANDIDATE_ASSERTION }),
     });
     assert.deepEqual(search.result.items, []);
     assert.equal(approvedMemories.has(CANDIDATE_URI), false);
     assert.equal(serverCalls.some(call => call.method === "POST" && call.path === "/api/v1/content/write"), false);
     assert.ok(serverCalls.some(call => call.route === "candidate" && call.uri === `${ARCHIVE_URI}/messages.jsonl`));
-    assert.ok(serverCalls.some(call => call.route === "approved" && call.uri === CANDIDATE_URI));
+    assert.ok(serverCalls.some(call => call.route === "approved" && call.uri === APPROVED_CANDIDATE_URI));
 
     const crossProject = await callTool(ctx, "openviking_review_proposal", {
       segmentId: SEGMENT_ID,

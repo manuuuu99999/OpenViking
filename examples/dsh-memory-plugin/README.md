@@ -340,9 +340,18 @@ For the MAN-351 extraction and trace check, set `MAN351_SYNTHETIC_MANIFEST` to
 the same manifest and run `node --test --test-isolation=none
 man351.integration.test.mjs`. These opt-in tests reject manifests outside the
 disposable root, non-loopback endpoints, and the usual active-service port 1933;
-they assert that the DSH event is archived, the asynchronous task yields a
-non-empty candidate diff, and approved content remains byte-for-byte unchanged.
-Stop the specific server process after the tests and verify its port is closed.
+they assert that the DSH event is archived, the asynchronous task yields one
+candidate, and approved content remains byte-for-byte unchanged. The MAN-351
+integration test also passes the real extracted Markdown candidate through the
+public MAN-352 review tool, checks the prepared and opened proposal as shown to
+the agent and in the review view, and confirms that approved memory stays
+unchanged. Its model response is deterministic, but the installed OpenViking
+server performs extraction storage, authorization, archival, and memory writes.
+The separate `man352.integration.test.mjs` uses simulated HTTP responses for
+repeatable public-interface regression checks, including Markdown parsing,
+substring rejection, negation, missing evidence, scope, and secret filtering;
+it does not establish that the real server emits that candidate shape. Stop the
+specific server process after the tests and verify its port is closed.
 The `run-<id>` directory contains synthetic data and keys; do not commit or
 copy it into an active profile. Regular `npm test` intentionally skips these
 opt-in tests instead of contacting a configured service.

@@ -140,7 +140,7 @@ async function prepareProposal({ args, signal, runtime, candidateClient, approve
     ...proposalMetadata(segment),
     id: proposalId(segment.projectId, segment.segmentId, evidence.candidateUri),
     status: "reviewable",
-    assertion: evidence.candidateText,
+    assertion: evidence.candidateAssertion,
     originalPassage: evidence.originalPassage,
     coverage: summarizeCoverage(segment),
     approvedPrevious: evidence.approvedPrevious,
@@ -159,7 +159,12 @@ async function openProposal(store, id) {
   if (!proposal) {
     return pendingProposal({ id, status: "pending", pendingReason: "proposal_not_found" });
   }
-  const secretFilterProblem = await hasKnownSecret(proposal.assertion, proposal.originalPassage, proposal.approvedPrevious?.text);
+  const secretFilterProblem = await hasKnownSecret(
+    proposal.assertion,
+    proposal.proposedText,
+    proposal.originalPassage,
+    proposal.approvedPrevious?.text,
+  );
   if (secretFilterProblem) {
     return pendingProposal({
       ...proposalMetadata(proposal),
@@ -220,18 +225,28 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
     };
   }
   const candidateText = candidate.value.trim();
-  const originalPassage = findOriginalPassage(archive.value, candidateText, segment.eventCoverage);
+  const candidateAssertion = extractCandidateAssertion(candidateText);
+  if (!candidateAssertion) {
+    const filterProblem = await hasKnownSecret(candidateText);
+    return {
+      ok: false,
+      reason: filterProblem || "candidate_assertion_not_unambiguous",
+    };
+  }
+
+  const originalPassage = findOriginalPassage(archive.value, candidateAssertion, segment.eventCoverage);
   if (!originalPassage) {
     const filterProblem = await hasKnownSecret(candidateText);
     return {
       ok: false,
       reason: filterProblem || "original_passage_not_verified",
-      ...(filterProblem ? {} : { safeAssertion: candidateText }),
+      ...(filterProblem ? {} : { safeAssertion: candidateAssertion }),
     };
   }
 
+  const approvedUri = approvedCounterpartUri(candidateUri, candidateClient, approvedClient);
   const approvedResponse = await approvedClient.fetchJSON(
-    `/api/v1/content/read?uri=${encodeURIComponent(candidateUri)}`,
+    `/api/v1/content/read?uri=${encodeURIComponent(approvedUri)}`,
     {},
     { signal },
   );
@@ -260,10 +275,10 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
       ok: false,
       status: "question",
       reason: "possible_approved_contradiction",
-      safeAssertion: candidateText,
+      safeAssertion: candidateAssertion,
       originalPassage,
       approvedPrevious,
-      question: `La afirmación extraída («${candidateText}») contradice lo aprobado («${approvedPrevious.text}»). ¿Quieres revisar esta diferencia? No se ha modificado la memoria aprobada.`,
+      question: `La afirmación extraída («${candidateAssertion}») contradice lo aprobado («${approvedPrevious.text}»). ¿Quieres revisar esta diferencia? No se ha modificado la memoria aprobada.`,
     };
   }
   if (approvedPrevious.status === "found") {
@@ -271,13 +286,13 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
       ok: false,
       status: "question",
       reason: "already_approved_no_change",
-      safeAssertion: candidateText,
+      safeAssertion: candidateAssertion,
       originalPassage,
       approvedPrevious,
       question: "Esta afirmación ya está aprobada sin cambios. ¿Quieres cerrar la revisión sin preparar otra alta?",
     };
   }
-  return { ok: true, candidateUri, candidateText, originalPassage, approvedPrevious };
+  return { ok: true, candidateUri, candidateText, candidateAssertion, originalPassage, approvedPrevious };
 }
 
 async function readContent(client, uri, signal, source) {
@@ -327,6 +342,48 @@ async function failureDetails(source, response) {
   };
 }
 
+function approvedCounterpartUri(candidateUri, candidateClient, approvedClient) {
+  const candidateUser = candidateClient.config?.user;
+  const approvedUser = approvedClient.config?.user;
+  if (!candidateUser || !approvedUser || candidateUser === approvedUser) return candidateUri;
+  const candidatePrefix = `viking://user/${candidateUser}/`;
+  if (!candidateUri.startsWith(candidatePrefix)) return candidateUri;
+  return `viking://user/${approvedUser}/${candidateUri.slice(candidatePrefix.length)}`;
+}
+
+function extractCandidateAssertion(candidateText) {
+  const headings = [...candidateText.matchAll(/^#{1,6}\s+(.+?)\s*$/gmu)];
+  let assertionText = candidateText;
+  if (headings.length > 0) {
+    const summaries = headings.filter(([, title]) => title.trim() === "Summary");
+    if (summaries.length !== 1) return "";
+    const summary = summaries[0];
+    const start = summary.index + summary[0].length;
+    const nextHeading = headings.find(heading => heading.index > summary.index);
+    assertionText = candidateText.slice(start, nextHeading?.index ?? candidateText.length);
+  }
+
+  const lines = assertionText.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+  if (lines.length !== 1) return "";
+  const assertion = lines[0];
+  if (!/[.!?。！？]$/u.test(assertion) || /[.!?。！？]\s+\S/u.test(assertion.slice(0, -1))) return "";
+  return assertion;
+}
+
+function hasCompleteAssertionBoundaries(source, start, assertion) {
+  let contextStart = 0;
+  for (let cursor = start - 1; cursor >= 0; cursor -= 1) {
+    if (/[.!?。！？;\n:]/u.test(source[cursor])) {
+      contextStart = cursor + 1;
+      break;
+    }
+  }
+  const before = source.slice(contextStart, start).trim();
+  const nextCharacter = source[start + assertion.length];
+  const afterBoundary = nextCharacter === undefined || /[\s"'”’)}\]]/u.test(nextCharacter);
+  return before === "" && afterBoundary;
+}
+
 function findOriginalPassage(archive, candidateText, eventCoverage = []) {
   const sourceHashes = new Set(eventCoverage
     .map(event => event.sourceTextHash)
@@ -337,7 +394,10 @@ function findOriginalPassage(archive, candidateText, eventCoverage = []) {
     if (!sourceHashes.has(createHash("sha256").update(text).digest("hex"))) continue;
     let matchIndex = text.indexOf(candidateText);
     while (matchIndex >= 0) {
-      if (!hasNegationOutsideCandidate(text, matchIndex, candidateText)) return text;
+      if (
+        hasCompleteAssertionBoundaries(text, matchIndex, candidateText)
+        && !hasNegationOutsideCandidate(text, matchIndex, candidateText)
+      ) return text;
       matchIndex = text.indexOf(candidateText, matchIndex + 1);
     }
   }

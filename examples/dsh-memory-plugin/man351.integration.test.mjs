@@ -15,7 +15,7 @@ const syntheticRootPath = process.env.MAN350_SYNTHETIC_ROOT || "";
 const FIXTURE_RUN_ID = randomUUID().replaceAll("-", "");
 const FACT_MARKER = `MAN351_FACT_${FIXTURE_RUN_ID}`;
 
-test("MAN-351 archives one DSH conversation, observes its non-empty extraction, and preserves approved memory", {
+test("MAN-351 extraction becomes an opened MAN-352 proposal without changing approved memory", {
   skip: !manifestPath && "set MAN351_SYNTHETIC_MANIFEST and MAN350_SYNTHETIC_ROOT for the disposable fixture",
 }, async () => {
   const manifest = realpathSync(manifestPath);
@@ -58,7 +58,9 @@ test("MAN-351 archives one DSH conversation, observes its non-empty extraction, 
   assert.equal(seeded.ok, true, JSON.stringify(seeded.error));
 
   const previousStateDir = process.env.OPENVIKING_STATE_DIR;
+  const previousPendingDir = process.env.OPENVIKING_PENDING_DIR;
   process.env.OPENVIKING_STATE_DIR = join(dirname(manifest), "man351-state");
+  process.env.OPENVIKING_PENDING_DIR = join(dirname(manifest), "man351-pending");
   const ctx = new Context();
   const traceUpdates = [];
   const originalDebug = ctx.logger.debug;
@@ -91,7 +93,8 @@ test("MAN-351 archives one DSH conversation, observes its non-empty extraction, 
       await waitFor(() => {
         const names = new Set(pluginCtx.tools.schemas().map(tool => tool.name));
         return names.has("mcp__openviking__read")
-          && names.has("mcp__openviking_history__read");
+          && names.has("mcp__openviking_history__read")
+          && names.has("openviking_review_proposal");
       }, 20000);
     },
   });
@@ -103,6 +106,7 @@ test("MAN-351 archives one DSH conversation, observes its non-empty extraction, 
       header: { cwd: process.cwd() },
       events: [],
     };
+    const sourceText = `Invented observation: ${FACT_MARKER} happened in the synthetic project.`;
     const userEvent = {
       id: `man351-user-event-${FIXTURE_RUN_ID}`,
       type: "user/message",
@@ -111,7 +115,7 @@ test("MAN-351 archives one DSH conversation, observes its non-empty extraction, 
         role: "user",
         content: [{
           type: "text",
-          text: `Record this invented test occurrence: ${FACT_MARKER} was delivered to the synthetic project.`,
+          text: sourceText,
         }],
         source: { kind: "user" },
       },
@@ -138,9 +142,13 @@ test("MAN-351 archives one DSH conversation, observes its non-empty extraction, 
     const memoryDiffText = await readContent(candidateClient, task.result.memory_diff_uri);
     const memoryDiff = JSON.parse(memoryDiffText);
     const additions = memoryDiff.operations?.adds || [];
-    assert.ok(additions.length > 0, `the controlled extraction must create a candidate memory: ${JSON.stringify(memoryDiff.operations)}`);
+    assert.equal(additions.length, 1, `the controlled extraction must create one unambiguous candidate: ${JSON.stringify(memoryDiff.operations)}`);
     const extractedMemory = await readContent(candidateClient, additions[0].uri);
-    assert.match(extractedMemory, new RegExp(FACT_MARKER));
+    const candidateAssertion = `${FACT_MARKER} happened in the synthetic project.`;
+    const summaryLine = extractedMemory.match(/^# Summary\r?\n([^\r\n]+)/u)?.[1];
+    assert.equal(summaryLine, candidateAssertion);
+    assert.ok(extractedMemory.length > candidateAssertion.length, "the server candidate must include the full Markdown memory, not only the summary");
+    assert.match(extractedMemory, /^# .*ChatLog:/mu);
 
     const approvedAfter = await readContent(approvedClient, approvedUri);
     assert.equal(approvedAfter, approvedBefore, "candidate extraction must leave approved memory byte-for-byte unchanged");
@@ -158,6 +166,63 @@ test("MAN-351 archives one DSH conversation, observes its non-empty extraction, 
     assert.equal(trace.extraction.taskId, task.task_id);
     assert.equal(trace.extraction.memoryDiffUri, task.result.memory_diff_uri);
     assert.ok(trace.extraction.operations.adds > 0);
+
+    const segmentId = `${session.id}:1`;
+    const prepared = await ctx.tools.execute({
+      callId: `man352-prepare-${FIXTURE_RUN_ID}`,
+      name: "openviking_review_proposal",
+      arguments: { segmentId },
+      signal: new AbortController().signal,
+    });
+    assert.equal(prepared.isError, false, JSON.stringify(prepared.error));
+    assert.equal(prepared.value.status, "reviewable", JSON.stringify(prepared.value));
+    assert.equal(prepared.value.project, config.peerId);
+    assert.equal(prepared.value.session, session.id);
+    assert.equal(prepared.value.segment, segmentId);
+    assert.equal(prepared.value.assertion, candidateAssertion);
+    assert.equal(prepared.value.originalPassage, sourceText);
+    assert.deepEqual(prepared.value.coverage.eventIds, [userEvent.id]);
+    assert.equal(prepared.value.approvedPrevious.status, "none");
+    assert.equal(prepared.value.proposedText, extractedMemory.trim());
+
+    const opened = await ctx.tools.execute({
+      callId: `man352-open-${FIXTURE_RUN_ID}`,
+      name: "openviking_review_proposal",
+      arguments: { proposalId: prepared.value.id },
+      signal: new AbortController().signal,
+    });
+    assert.equal(opened.isError, false, JSON.stringify(opened.error));
+    const agentOutput = opened.content.map(part => part.text || "").join("\n");
+    for (const visible of [config.peerId, session.id, segmentId, candidateAssertion, sourceText, extractedMemory.trim()]) {
+      assert.ok(agentOutput.includes(visible), `the agent must receive ${visible.slice(0, 120)}`);
+    }
+
+    const proposalTool = ctx.tools.get("openviking_review_proposal");
+    const view = proposalTool.presentResult(
+      { proposalId: prepared.value.id },
+      { content: opened.content, isError: false, meta: opened.meta },
+    );
+    assert.equal(view.card, "generic");
+    assert.equal(view.title, "Propuesta de memoria");
+    for (const visible of [config.peerId, session.id, segmentId, candidateAssertion, sourceText, extractedMemory.trim()]) {
+      assert.ok(view.content.includes(visible), `the review view must show ${visible.slice(0, 120)}`);
+    }
+
+    const candidateUri = additions[0].uri;
+    const candidateUserPrefix = `viking://user/${routes.candidate.user}/`;
+    assert.ok(candidateUri.startsWith(candidateUserPrefix));
+    const approvedCandidateUri = `viking://user/${routes.approved.user}/${candidateUri.slice(candidateUserPrefix.length)}`;
+    const candidateInApproved = await approvedClient.fetchJSON(
+      `/api/v1/content/read?uri=${encodeURIComponent(candidateUri)}`,
+    );
+    assert.equal(candidateInApproved.ok, false);
+    assert.equal(candidateInApproved.status, 403, "the approved identity must not read the candidate user's private URI");
+    const approvedCounterpart = await approvedClient.fetchJSON(
+      `/api/v1/content/read?uri=${encodeURIComponent(approvedCandidateUri)}`,
+    );
+    assert.equal(approvedCounterpart.ok, false);
+    assert.equal(approvedCounterpart.status, 404, "the equivalent approved path has no prior memory");
+    assert.equal(await readContent(approvedClient, approvedUri), approvedBefore);
   } finally {
     await compositionFiber.dispose();
     await toolsFiber.dispose();
@@ -165,6 +230,8 @@ test("MAN-351 archives one DSH conversation, observes its non-empty extraction, 
     ctx.logger.debug = originalDebug;
     if (previousStateDir === undefined) delete process.env.OPENVIKING_STATE_DIR;
     else process.env.OPENVIKING_STATE_DIR = previousStateDir;
+    if (previousPendingDir === undefined) delete process.env.OPENVIKING_PENDING_DIR;
+    else process.env.OPENVIKING_PENDING_DIR = previousPendingDir;
   }
 });
 
