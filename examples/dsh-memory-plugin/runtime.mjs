@@ -1,4 +1,6 @@
-import { isCaptureEnabled } from "./shared/capture-utils.mjs";
+import { createHash } from "node:crypto";
+
+import { extractTextFromContent, isCaptureEnabled } from "./shared/capture-utils.mjs";
 import { buildProfileBlock } from "./shared/profile-inject.mjs";
 import { buildRecallBlock, isRecallEnabled } from "./shared/recall-core.mjs";
 import {
@@ -57,11 +59,36 @@ export class OpenVikingRuntime {
       hasPendingWrites: false,
       pendingCreatedAt: 0,
       segmentSequence: 0,
+      segments: [],
       currentSegment: null,
       disposing: null,
     };
     this.states.set(session.id, state);
     return state;
+  }
+
+  listProposalSegments() {
+    return [...this.states.values()].flatMap(state => state.segments.map(segment => ({
+      projectId: String(segment.projectId || ""),
+      dshSessionId: state.dshSessionId,
+      openVikingSessionId: state.ovSessionId,
+      segmentId: segment.segmentId,
+      coveredEventIds: segment.eventCoverage.map(item => item.eventId).filter(Boolean),
+      eventCoverage: segment.eventCoverage.map(item => ({ ...item })),
+      coverageStatus: segment.coverageStatus || "observed",
+      capture: {
+        status: summarizeCaptureStatus(segment.eventCoverage),
+        capturedEvents: segment.eventCoverage.filter(item => item.captureStatus === "captured").length,
+        pendingEvents: segment.eventCoverage.filter(item => item.captureStatus === "pending" || item.captureStatus === "pending_queue").length,
+        truncatedEvents: segment.eventCoverage.filter(item => item.truncated).length,
+      },
+      archive: { ...segment.archive },
+      extraction: { ...segment.extraction },
+    })));
+  }
+
+  async findProposalSegment(segmentId) {
+    return this.listProposalSegments().find(segment => segment.segmentId === segmentId) || null;
   }
 
   async initialize(agent) {
@@ -155,8 +182,15 @@ export class OpenVikingRuntime {
     const captured = captureEventDetails(event, state.config, state.toolNames);
     if (!captured.payload) return;
 
+    const sourceText = extractTextFromContent(
+      captured.payload.parts ?? captured.payload.content ?? "",
+      { toolMaxChars: state.config.captureToolMaxChars },
+    );
+    const sourceTextHash = sourceText
+      ? createHash("sha256").update(sourceText).digest("hex")
+      : "";
     const segment = this.currentSegment(state);
-    const coverage = this.addCoveredEvent(session, segment, event, captured.truncated);
+    const coverage = this.addCoveredEvent(session, segment, event, captured.truncated, sourceTextHash);
     if (isUnattributedIsolatedSession(state.config)) {
       coverage.captureStatus = "pending_project";
       segment.pendingReason = "project_unassigned";
@@ -288,10 +322,11 @@ export class OpenVikingRuntime {
       archive: { status: "pending" },
       extraction: { status: "not_started" },
     };
+    state.segments.push(state.currentSegment);
     return state.currentSegment;
   }
 
-  addCoveredEvent(session, segment, event, truncated) {
+  addCoveredEvent(session, segment, event, truncated, sourceTextHash) {
     const reference = eventReference(session, event);
     const hasStableReference = reference.eventId !== null || reference.eventSequence !== null;
     const existing = hasStableReference
@@ -306,6 +341,7 @@ export class OpenVikingRuntime {
       eventType: String(event?.type || "unknown"),
       captureStatus: "pending",
       truncated: Boolean(truncated),
+      sourceTextHash,
     };
     segment.eventCoverage.push(coverage);
     if (truncated) segment.coverageStatus = "truncated";
@@ -320,7 +356,7 @@ export class OpenVikingRuntime {
       segmentId: segment.segmentId,
       trigger: segment.trigger,
       coveredEventIds: segment.eventCoverage.map(item => item.eventId).filter(Boolean),
-      eventCoverage: segment.eventCoverage.map(item => ({ ...item })),
+      eventCoverage: segment.eventCoverage.map(({ sourceTextHash, ...item }) => ({ ...item })),
       coverageStatus: segment.coverageStatus || "observed",
       capture: {
         status: summarizeCaptureStatus(segment.eventCoverage),

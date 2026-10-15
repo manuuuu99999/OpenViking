@@ -2,6 +2,7 @@ import { OpenVikingClient } from "./client.mjs";
 import { resolveConfig } from "./config.mjs";
 import { injectStartupProfile } from "./lifecycle.mjs";
 import { mountOpenVikingMcp } from "./mcp.mjs";
+import { mountProposalTools } from "./proposal-tools.mjs";
 import { OpenVikingRuntime } from "./runtime.mjs";
 import { mountOpenVikingSkills } from "./skills.mjs";
 import { guardVikingUri, noticeVikingUri } from "./uri-guard.mjs";
@@ -31,6 +32,9 @@ export function apply(ctx, input = {}) {
     config.skipSubagentSessions && session?.header?.origin === "subagent"
   );
   ctx.provide("openvikingMemory", runtime);
+  if (config.memoryIsolation) {
+    mountProposalTools(ctx, { runtime, candidateClient: client, approvedClient });
+  }
   ctx.effect(
     () => () => runtime.disposeAll(),
     "openvikingMemory.disposeAll()",

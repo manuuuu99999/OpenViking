@@ -15,7 +15,7 @@ test("bundle uses neutral DSH naming and bounded peers", async () => {
     new URL("./package.json", import.meta.url),
     "utf8",
   ));
-  const patch = await readFile(new URL("./cordis.patch.yml", import.meta.url), "utf8");
+  const patch = (await readFile(new URL("./cordis.patch.yml", import.meta.url), "utf8")).replace(/\r\n/gu, "\n");
 
   assert.equal(manifest.name, "@openviking/dsh-memory-plugin");
   assert.equal(manifest.dependencies, undefined);
@@ -50,6 +50,13 @@ test("bundle uses neutral DSH naming and bounded peers", async () => {
   );
   assert.doesNotMatch(JSON.stringify(manifest), FORBIDDEN_PATTERN);
   assert.doesNotMatch(patch, FORBIDDEN_PATTERN);
+});
+
+test("proposal review modules ship with the plugin entrypoint", async () => {
+  const manifest = JSON.parse(await readFile(new URL("./package.json", import.meta.url), "utf8"));
+  for (const file of ["proposal-tools.mjs", "known-secret-filter.mjs"]) {
+    assert.ok(manifest.files.includes(file), `${file} must be included in the published bundle`);
+  }
 });
 
 test("the runtime and package lock report the published package version", async () => {

@@ -13,6 +13,8 @@
   "files": [
     "icon.svg",
     "index.mjs",
+    "proposal-tools.mjs",
+    "known-secret-filter.mjs",
     "client.mjs",
     "config.mjs",
     "capture.mjs",

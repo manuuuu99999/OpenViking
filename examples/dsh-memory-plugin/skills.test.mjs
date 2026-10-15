@@ -51,7 +51,7 @@ test("the bundled skill stays readable without watching the installed package", 
 test("the vendored skill ships at the served path", () => {
   const skill = readFileSync(join(SKILLS_DIR, "openviking-memory", "SKILL.md"), "utf8");
 
-  assert.match(skill, /^---\nname: openviking-memory\n/);
+  assert.match(skill.replace(/\r\n/gu, "\n"), /^---\nname: openviking-memory\n/);
   // The skill text must stay harness-neutral: dsh publishes the tools under an
   // `mcp__openviking__` prefix, which is one of the forms it already names.
   assert.match(skill, /mcp__openviking__/);
