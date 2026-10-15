@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync, realpathSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { Context } from "@deepseek-ai/cordis";
 import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
@@ -8,6 +8,7 @@ import { ToolRuntime } from "@deepseek-ai/dsh-tools";
 import { apply as applyOpenViking } from "./index.mjs";
 import { OpenVikingClient } from "./client.mjs";
 import { deriveDshSessionId } from "./session-id.mjs";
+import { buildRecallBlock } from "./shared/recall-core.mjs";
 
 const manifestPath = process.env.MAN350_SYNTHETIC_MANIFEST || "";
 const syntheticRootPath = process.env.MAN350_SYNTHETIC_ROOT || "";
@@ -22,6 +23,8 @@ test("MAN-350 DSH composition keeps capture, approved reads, history, and MCP to
   assert.equal(dirname(dirname(manifest)), realpathSync(syntheticRootPath));
   assert.match(basename(dirname(manifest)), /^run-[a-f0-9]{12}$/);
 
+  const previousStateDir = process.env.OPENVIKING_STATE_DIR;
+  process.env.OPENVIKING_STATE_DIR = join(dirname(manifest), "state");
   const { url, keys } = JSON.parse(readFileSync(manifest, "utf8"));
   const endpoint = new URL(url);
   assert.equal(endpoint.protocol, "http:");
@@ -160,6 +163,22 @@ test("MAN-350 DSH composition keeps capture, approved reads, history, and MCP to
     assert.doesNotMatch(recallText, new RegExp(`${markers.candidate}|${markers.history}|${markers.other}|${markers.legacy}`));
     for (const key of Object.values(keys)) assert.ok(!recallText.includes(key), "fixture credentials must not appear in recall");
 
+    // Simulate an older server without the assembled context endpoint, but
+    // keep every subsequent request on the real approved identity.
+    const fallbackPaths = [];
+    const fallbackClient = new OpenVikingClient({ endpoint: url, apiKey: keys["man350_project_a:approved"], requestTimeoutMs: 5000 });
+    const fallback = await buildRecallBlock(async (path, init, options) => {
+      fallbackPaths.push(path);
+      if (path === "/api/v1/search/search" && JSON.parse(init.body).mode === "context") {
+        return { ok: false, status: 404 };
+      }
+      return fallbackClient.fetchJSON(path, init, options);
+    }, { ...config, user: "approved" }, markers.approved);
+    assert.ok(fallbackPaths.includes("/api/v1/search/recall"));
+    assert.match(fallback || "", new RegExp(markers.approved));
+    assert.doesNotMatch(fallback, new RegExp(`${markers.candidate}|${markers.history}|${markers.other}|${markers.legacy}`));
+    for (const key of Object.values(keys)) assert.ok(!fallback.includes(key), "fallback must not reveal fixture credentials");
+
     ctx.emit("session/event", session, {
       type: "user/message",
       data: { ...prompt, content: [{ type: "text", text: `Synthetic DSH capture ${markers.candidate}` }] },
@@ -220,6 +239,9 @@ test("MAN-350 DSH composition keeps capture, approved reads, history, and MCP to
     const historyRead = await callTool(ctx, "mcp__openviking_history__read", { uris: [historyUri] });
     assert.equal(historyRead.isError, false, JSON.stringify(historyRead.error));
     assert.match(toolText(historyRead), new RegExp(markers.history));
+    const historyNotice = (historyRead.additionalContexts || [])
+      .flatMap(message => message.content || []).map(part => part.text || "").join("\n");
+    assert.match(historyNotice, /no es conocimiento vigente aprobado/i);
 
     const hiddenWrite = await callTool(ctx, "mcp__openviking__write", {
       uri: approvedUri,
@@ -235,6 +257,8 @@ test("MAN-350 DSH composition keeps capture, approved reads, history, and MCP to
     await compositionFiber.dispose();
     await toolsFiber.dispose();
     await promptFiber.dispose();
+    if (previousStateDir === undefined) delete process.env.OPENVIKING_STATE_DIR;
+    else process.env.OPENVIKING_STATE_DIR = previousStateDir;
   }
 });
 

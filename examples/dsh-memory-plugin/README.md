@@ -328,7 +328,9 @@ models are used. Only the embedding/text models are deterministic substitutes;
 synthetic long-term extraction produces no new memories. The installed
 OpenViking server handles storage, identities, HTTP routes and authorization.
 This test proves captured session content and access boundaries, **not** real
-model-driven memory extraction. Keep the process alive for the test; set
+model-driven memory extraction. It also forces the context endpoint unavailable
+for one approved-only fallback lookup and checks that a historical tool result
+carries its warning in the DSH tool result. Keep the process alive for the test; set
 `MAN350_SYNTHETIC_MANIFEST` to the printed absolute `identities.json` path and
 run `node --test --test-isolation=none man350.integration.test.mjs` from this
 package directory. The test rejects a manifest outside the disposable root,
