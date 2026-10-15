@@ -20,7 +20,7 @@ import { createOpenVikingMcpProxy } from "../shared/mcp-proxy-core.mjs";
 
 export function readProxyConfig(env = process.env, cwd = process.cwd()) {
   const cfg = resolveConfig({}, env, cwd);
-  return toMcpProxyConfig(cfg, {
+  const proxyConfig = toMcpProxyConfig(cfg, {
     env,
     // The child env carries the runtime's resolved peer, but the shared mapper
     // still decides whether the proxy may send it. In broad recall mode the
@@ -29,6 +29,14 @@ export function readProxyConfig(env = process.env, cwd = process.cwd()) {
     debug: env.OV_DEBUG_LOG ? true : cfg.debug,
     debugLogPath: env.OV_DEBUG_LOG || cfg.debugLogPath,
   });
+  const restricted = Object.prototype.hasOwnProperty.call(env, "OPENVIKING_MCP_ALLOWED_TOOLS");
+  return {
+    ...proxyConfig,
+    ...(restricted ? {
+      allowedTools: String(env.OPENVIKING_MCP_ALLOWED_TOOLS).split(",").map(name => name.trim()).filter(Boolean),
+    } : {}),
+    toolDescriptionPrefix: env.OPENVIKING_MCP_TOOL_DESCRIPTION_PREFIX || "",
+  };
 }
 
 function isDirectRun() {

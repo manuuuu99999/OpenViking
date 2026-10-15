@@ -18,8 +18,9 @@ import {
 import { deriveDshSessionId } from "./session-id.mjs";
 
 export class OpenVikingRuntime {
-  constructor(client, config, logger = console, resolveSessionPeer = null) {
+  constructor(client, config, logger = console, resolveSessionPeer = null, { approvedClient = client } = {}) {
     this.client = client;
+    this.readClient = approvedClient;
     this.config = config;
     this.logger = logger;
     this.resolveSessionPeer = resolveSessionPeer;
@@ -100,7 +101,7 @@ export class OpenVikingRuntime {
     }
     await this.refreshPendingState(state);
     const profile = await buildProfileBlock(
-      (path, init, options) => this.client.fetchJSON(path, init, options),
+      (path, init, options) => this.readClient.fetchJSON(path, init, options),
       state.config.profileTokenBudget,
       state.config.peerId,
       state.config,
@@ -133,7 +134,7 @@ export class OpenVikingRuntime {
     const query = promptText(messages);
     if (!query || query.length < state.config.minQueryLength) return null;
     const block = await buildRecallBlock(
-      (path, init, options) => this.client.fetchJSON(path, init, options),
+      (path, init, options) => this.readClient.fetchJSON(path, init, options),
       state.config,
       query,
       {

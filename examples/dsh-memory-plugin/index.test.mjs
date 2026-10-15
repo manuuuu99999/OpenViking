@@ -2,6 +2,83 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { apply } from "./index.mjs";
 
+test("isolated DSH capture uses candidate credentials while the profile reads approved only", async () => {
+  const handlers = new Map();
+  let runtime;
+  const ctx = {
+    logger: { debug() {} },
+    provide(name, value) {
+      if (name === "openvikingMemory") runtime = value;
+    },
+    effect(execute) {
+      execute();
+      return async () => {};
+    },
+    tools: { register() {} },
+    plugin() {},
+    on(name, handler) {
+      handlers.set(name, handler);
+    },
+  };
+  const routes = {
+    candidate: { endpoint: "http://candidate.test", apiKey: "candidate-key", account: "project-a", user: "candidate" },
+    approved: { endpoint: "http://approved.test", apiKey: "approved-key", account: "project-a", user: "approved" },
+    history: { endpoint: "http://history.test", apiKey: "history-key", account: "project-a", user: "history" },
+  };
+  const seen = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    const authorization = new Headers(init.headers).get("authorization");
+    seen.push({ path, authorization });
+    if (path === "/api/v1/system/status") return response({ user: "approved" });
+    if (path.startsWith("/api/v1/content/read")) return response("Approved profile only");
+    if (path === "/api/v1/fs/ls") return response([]);
+    if (path === "/api/v1/skills") return response({ skills: [] });
+    return response({});
+  };
+
+  try {
+    apply(ctx, {
+      endpoint: "http://legacy.test",
+      apiKey: "legacy-key",
+      workspacePeer: false,
+      peerId: "project-a",
+      memoryIsolation: routes,
+    });
+    runtime.stopDrainer();
+    const agent = {
+      status: "idle",
+      session: { id: "isolated-project-a", header: { cwd: "/workspace/project-a" } },
+      injected: [],
+      inject(message) { this.injected.push(message); },
+      ctx: { effect() { return async () => {}; } },
+    };
+
+    assert.equal(await handlers.get("agent/created")({ agent, source: "startup" }), undefined);
+    const query = [message("Read approved knowledge")];
+    await handlers.get("agent/pre-step")({
+      agent,
+      messages: query,
+      signal: new AbortController().signal,
+    }, async () => ({ kind: "enter", messages: query }));
+    handlers.get("session/event")(agent.session, {
+      type: "user/message",
+      data: message("Synthetic candidate conversation"),
+    });
+    await handlers.get("session/flush")(agent.session);
+
+    assert.match(agent.injected[0].content[0].text, /Approved profile only/);
+    assert.ok(seen.some(call => call.path.startsWith("/api/v1/content/read") && call.authorization === "Bearer approved-key"));
+    assert.ok(seen.some(call => call.path === "/api/v1/search/search" && call.authorization === "Bearer approved-key"));
+    assert.ok(seen.some(call => call.path.endsWith("/messages") && call.authorization === "Bearer candidate-key"));
+    assert.equal(seen.some(call => call.authorization === "Bearer legacy-key"), false);
+  } finally {
+    runtime?.stopDrainer();
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("session filtering skips subagents without changing main-session recall", async () => {
   const handlers = new Map();
   let memoryRuntime;

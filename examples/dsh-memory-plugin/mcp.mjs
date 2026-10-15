@@ -2,7 +2,7 @@ import * as mcpClient from "@deepseek-ai/dsh-mcp-client";
 
 import { buildMcpConfig } from "./mcp-env.mjs";
 
-export { buildMcpConfig, PROXY_PATH } from "./mcp-env.mjs";
+export { buildMcpConfig, PROXY_PATH, READ_ONLY_MCP_TOOLS } from "./mcp-env.mjs";
 
 /**
  * Mount the tool surface. The bridge ships with dsh itself, so it resolves
@@ -11,5 +11,8 @@ export { buildMcpConfig, PROXY_PATH } from "./mcp-env.mjs";
  * against a server whose MCP endpoint is unreachable.
  */
 export function mountOpenVikingMcp(ctx, config) {
-  return ctx.plugin(mcpClient, buildMcpConfig(config));
+  if (!config.memoryIsolation) return ctx.plugin(mcpClient, buildMcpConfig(config));
+  const approved = ctx.plugin(mcpClient, buildMcpConfig(config, { role: "approved" }));
+  const history = ctx.plugin(mcpClient, buildMcpConfig(config, { role: "history" }));
+  return [approved, history];
 }

@@ -339,6 +339,42 @@ test("a proxy with no local tool provider passes both tool methods through", asy
   });
 });
 
+test("an isolated route hides tools and denies direct calls outside its allowlist", async () => {
+  await withServer((_req, res, entry) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (entry.body.method === "tools/list") {
+      res.end(JSON.stringify(jsonRpc(entry.body.id, {
+        tools: [
+          { name: "search", inputSchema: { type: "object" } },
+          { name: "remember", inputSchema: { type: "object" } },
+          { name: "write", inputSchema: { type: "object" } },
+        ],
+      })));
+      return;
+    }
+    res.end(JSON.stringify(jsonRpc(entry.body.id, { content: [{ type: "text", text: "unexpected" }] })));
+  }, async ({ url, requests }) => {
+    const { proxy, messages } = makeProxy({
+      url,
+      configOverrides: { allowedTools: ["search"] },
+    });
+
+    await proxy.handleMessage({ jsonrpc: "2.0", id: 40, method: "tools/list" });
+    await proxy.handleMessage({
+      jsonrpc: "2.0",
+      id: 41,
+      method: "tools/call",
+      params: { name: "write", arguments: { uri: "viking://user/default/memories" } },
+    });
+
+    const [listed, denied] = await messages();
+    assert.deepEqual(listed.result.tools.map(tool => tool.name), ["search"]);
+    assert.equal(denied.error.code, -32005);
+    assert.match(denied.error.message, /not permitted/i);
+    assert.deepEqual(requests.map(request => request.body.method), ["tools/list"]);
+  });
+});
+
 test("reloads changed credential files before calling a local tool", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "openviking-mcp-proxy-"));
   const credentialPath = join(dir, "ovcli.conf");

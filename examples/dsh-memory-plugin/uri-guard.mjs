@@ -1,6 +1,6 @@
 import { boundContextSummary } from "@deepseek-ai/dsh-llm";
 import { pluginMessage } from "./capture.mjs";
-import { MCP_SERVER_NAME } from "./config.mjs";
+import { MCP_HISTORY_SERVER_NAME, MCP_SERVER_NAME } from "./config.mjs";
 import { addSkillExample, evaluateUriGuard, evaluateUriNotice, isSkillUri } from "./shared/uri-guard.mjs";
 
 /** Model-facing name of a bridged OpenViking MCP tool. */
@@ -51,19 +51,30 @@ export async function guardVikingUri(exec, next) {
 }
 
 // Delegates first so a later listener's block or content replacement survives;
-// the notice only rides along as one more context.
+// notices only ride along as additional context.
 export async function noticeVikingUri(exec, _result, next) {
   const notice = evaluateUriNotice(exec.name, exec.arguments, { hints: GUARDED_TOOLS });
-  if (!notice) return next();
+  const isHistoryRoute = String(exec?.name || "").startsWith(`mcp__${MCP_HISTORY_SERVER_NAME}__`);
+  if (!notice && !isHistoryRoute) return next();
   const decision = await next();
-  const context = pluginMessage(notice.reason, {
-    form: "notice",
-    summary: boundContextSummary(`OpenViking URI guard: shell command contains ${notice.uri}`),
-  });
-  return {
-    ...decision,
-    additionalContexts: [...(decision.additionalContexts ?? []), context],
-  };
+  const additionalContexts = [...(decision.additionalContexts ?? [])];
+  if (notice) {
+    additionalContexts.push(pluginMessage(notice.reason, {
+      form: "notice",
+      summary: boundContextSummary(`OpenViking URI guard: shell command contains ${notice.uri}`),
+    }));
+  }
+  if (isHistoryRoute) {
+    additionalContexts.push(pluginMessage(
+      "AVISO: Este resultado procede de la vía histórica de OpenViking. No es conocimiento vigente aprobado. Úsalo solo para consulta histórica deliberada y coteja el original antes de afirmarlo.",
+      {
+        form: "notice",
+        route: "history",
+        summary: boundContextSummary("OpenViking history result is archived, not current approved knowledge."),
+      },
+    ));
+  }
+  return { ...decision, additionalContexts };
 }
 
 function escapeText(value) {

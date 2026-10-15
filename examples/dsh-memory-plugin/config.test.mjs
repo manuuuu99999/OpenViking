@@ -125,3 +125,32 @@ test("a configured peer survives an empty credential peer", async () => {
   assert.equal(config.peerId, "dsh-peer");
   assert.equal(config.explicitPeerId, "dsh-peer");
 });
+
+test("incomplete isolated memory configuration fails instead of using legacy credentials", () => {
+  assert.throws(
+    () => resolveConfig({ memoryIsolation: { candidate: {} } }, {}),
+    /memoryIsolation.*approved.*history/i,
+  );
+});
+
+test("isolated candidate route replaces the legacy connection without sharing its credentials", () => {
+  const config = resolveConfig({
+    endpoint: "http://legacy.example",
+    apiKey: "legacy-key",
+    account: "legacy-account",
+    user: "legacy-user",
+    memoryIsolation: {
+      candidate: { endpoint: "http://127.0.0.1:1933/", apiKey: "candidate-key", account: "project-a", user: "candidate" },
+      approved: { endpoint: "http://127.0.0.1:1933/", apiKey: "approved-key", account: "project-a", user: "approved" },
+      history: { endpoint: "http://127.0.0.1:1933/", apiKey: "history-key", account: "project-a", user: "history" },
+    },
+  }, {});
+
+  assert.equal(config.endpoint, "http://127.0.0.1:1933");
+  assert.equal(config.apiKey, "candidate-key");
+  assert.equal(config.account, "project-a");
+  assert.equal(config.user, "candidate");
+  assert.equal(config.authMode, "api_key");
+  assert.equal(config.memoryIsolation.approved.apiKey, "approved-key");
+  assert.equal(config.memoryIsolation.history.apiKey, "history-key");
+});

@@ -182,20 +182,38 @@ export function createOpenVikingMcpProxy({
     } catch { /* debug logging must never affect protocol IO */ }
   }
 
+  function isToolAllowed(name) {
+    return !Array.isArray(proxyConfig.allowedTools) || proxyConfig.allowedTools.includes(name);
+  }
+
   function localTools() {
     if (!localToolProvider || typeof localToolProvider.listTools !== "function") return [];
     const tools = localToolProvider.listTools();
-    return Array.isArray(tools) ? tools : [];
+    return Array.isArray(tools) ? tools.filter((tool) => isToolAllowed(tool?.name)) : [];
   }
 
   function appendLocalTools(message, outbound) {
     if (message.method !== "tools/list" || !Array.isArray(outbound?.result?.tools)) {
       return outbound;
     }
-    const additions = localTools().filter((tool) => tool?.name);
-    if (additions.length === 0) return outbound;
+    const describe = (tool) => {
+      const prefix = String(proxyConfig.toolDescriptionPrefix || "").trim();
+      if (!prefix || !tool?.name) return tool;
+      return {
+        ...tool,
+        description: [prefix, tool.description].filter(Boolean).join("\n\n"),
+      };
+    };
+    const additions = localTools().filter((tool) => tool?.name).map(describe);
     const localNames = new Set(additions.map((tool) => tool.name));
-    const upstreamTools = outbound.result.tools.filter((tool) => !localNames.has(tool?.name));
+    const upstreamTools = outbound.result.tools.filter((tool) => (
+      isToolAllowed(tool?.name) && !localNames.has(tool?.name)
+    )).map(describe);
+    if (
+      additions.length === 0
+      && upstreamTools.length === outbound.result.tools.length
+      && !String(proxyConfig.toolDescriptionPrefix || "").trim()
+    ) return outbound;
     return {
       ...outbound,
       result: {
@@ -440,6 +458,14 @@ export function createOpenVikingMcpProxy({
     }
 
     try {
+      if (message.method === "tools/call" && !isToolAllowed(message.params?.name)) {
+        await writeMessage(errorResponse(
+          message.id,
+          -32005,
+          `OpenViking tool "${String(message.params?.name || "")}" is not permitted on this route.`,
+        ));
+        return;
+      }
       const localResult = await callLocalTool(message);
       if (localResult !== null) {
         if (expectsResponse) {

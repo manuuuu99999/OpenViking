@@ -11,12 +11,22 @@ export const inject = ["agents", "sessions", "tools"];
 
 export function apply(ctx, input = {}) {
   const config = resolveConfig(input);
-  const client = new OpenVikingClient(config);
+  const clientFor = route => new OpenVikingClient({
+    ...config,
+    ...route,
+    peerId: config.peerId,
+  });
+  const client = config.memoryIsolation
+    ? clientFor(config.memoryIsolation.candidate)
+    : new OpenVikingClient(config);
+  const approvedClient = config.memoryIsolation
+    ? clientFor(config.memoryIsolation.approved)
+    : client;
   const runtime = new OpenVikingRuntime(client, config, ctx.logger, cwd => (
     // Rebuild from the host input, not the config already merged for boot's cwd.
     // The shared loader preserves host/env precedence over workspace peers.
     resolveConfig(input, process.env, cwd).effectivePeer
-  ));
+  ), { approvedClient });
   const skipMemory = session => (
     config.skipSubagentSessions && session?.header?.origin === "subagent"
   );

@@ -167,6 +167,22 @@ test("the notice keeps a downstream decision and its contexts", async () => {
   assert.equal(decision.additionalContexts[1].source.form, "notice");
 });
 
+test("historical MCP tools add a visible warning to their result", async () => {
+  const earlier = { id: "approved-context" };
+  const decision = await noticeVikingUri(
+    { name: "mcp__openviking_history__search", arguments: { query: "old decision" } },
+    okResult(),
+    async () => ({ kind: "accept", additionalContexts: [earlier] }),
+  );
+
+  assert.equal(decision.kind, "accept");
+  assert.equal(decision.additionalContexts[0], earlier);
+  const [warning] = decision.additionalContexts.slice(1);
+  assert.equal(warning.source.form, "notice");
+  assert.match(warning.content[0].text, /históric[oa]/i);
+  assert.match(warning.content[0].text, /no es conocimiento vigente aprobado/i);
+});
+
 test("the notice leaves file tools, plain shell commands, and denied reads alone", async () => {
   const cases = [
     [{ name: "read", arguments: { file_path: "viking://user/default/memories/p.md" } }, {

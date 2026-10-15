@@ -50,6 +50,30 @@ test("the mount config validates against the pinned bridge's own schema", () => 
   assert.equal(parsed.reconnect.enabled, true);
 });
 
+test("isolated route bridges use only approved or history credentials and a read-only tool set", () => {
+  const config = resolveConfig({
+    workspacePeer: false,
+    peerId: "project-a",
+    memoryIsolation: {
+      candidate: { endpoint: "http://127.0.0.1:49327", apiKey: "candidate-key", account: "project-a", user: "candidate" },
+      approved: { endpoint: "http://127.0.0.1:49327", apiKey: "approved-key", account: "project-a", user: "approved" },
+      history: { endpoint: "http://127.0.0.1:49327", apiKey: "history-key", account: "project-a", user: "history" },
+    },
+  }, {});
+  const approved = Config(buildMcpConfig(config, { role: "approved", serverName: "openviking" }));
+  const history = Config(buildMcpConfig(config, { role: "history", serverName: "openviking_history" }));
+
+  assert.equal(approved.serverName, "openviking");
+  assert.equal(approved.env.OPENVIKING_API_KEY, "approved-key");
+  assert.deepEqual(approved.env.OPENVIKING_MCP_ALLOWED_TOOLS.split(","), ["find", "search", "read", "list", "tree", "grep", "glob", "health"]);
+  assert.equal(approved.env.OPENVIKING_API_KEY.includes("candidate"), false);
+  assert.equal(approved.env.OPENVIKING_API_KEY.includes("history"), false);
+  assert.equal(history.serverName, "openviking_history");
+  assert.equal(history.env.OPENVIKING_API_KEY, "history-key");
+  assert.match(history.env.OPENVIKING_MCP_TOOL_DESCRIPTION_PREFIX, /historical|history/i);
+  assert.throws(() => buildMcpConfig(config, { role: "candidate" }), /candidate.*never.*tool/i);
+});
+
 test("the shipped proxy entrypoint exists at the mounted path", () => {
   assert.equal(existsSync(PROXY_PATH), true);
 });

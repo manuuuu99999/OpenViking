@@ -1,5 +1,5 @@
 import { buildPluginConfig } from "./shared/plugin-config.mjs";
-import { loadCredentialFiles } from "./shared/credentials.mjs";
+import { CREDENTIAL_ENV_VARS, loadCredentialFiles } from "./shared/credentials.mjs";
 
 export const PLUGIN_VERSION = "0.5.25";
 
@@ -9,6 +9,7 @@ export const PLUGIN_VERSION = "0.5.25";
  * model-facing contract: changing it renames all of them.
  */
 export const MCP_SERVER_NAME = "openviking";
+export const MCP_HISTORY_SERVER_NAME = "openviking_history";
 
 /**
  * Resolve the plugin's configuration.
@@ -42,6 +43,79 @@ export function resolveConfig(input = {}, env = process.env, cwd = process.cwd()
     },
     deriveEffectivePeer: true,
   });
+  const memoryIsolation = Object.prototype.hasOwnProperty.call(input, "memoryIsolation")
+    ? normalizeMemoryIsolation(input.memoryIsolation)
+    : null;
 
-  return { ...config, peerId: config.effectivePeer.peerId };
+  const candidate = memoryIsolation?.candidate;
+  return {
+    ...config,
+    ...(candidate ? {
+      endpoint: candidate.endpoint,
+      baseUrl: candidate.baseUrl,
+      mcpUrl: `${candidate.endpoint}/mcp`,
+      apiKey: candidate.apiKey,
+      account: candidate.account,
+      user: candidate.user,
+      authMode: candidate.authMode,
+      sendIdentityHeaders: candidate.sendIdentityHeaders,
+      credentialSource: "memoryIsolation",
+      hasApiKey: true,
+    } : {}),
+    peerId: config.effectivePeer.peerId,
+    ...(memoryIsolation ? { memoryIsolation } : {}),
+  };
+}
+
+const MEMORY_ROLES = ["candidate", "approved", "history"];
+
+function normalizeMemoryIsolation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("memoryIsolation must define candidate, approved, and history routes.");
+  }
+
+  const errors = [];
+  const routes = {};
+  for (const role of MEMORY_ROLES) {
+    const source = value[role];
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      errors.push(`${role} route is missing`);
+      continue;
+    }
+    const endpoint = typeof source.endpoint === "string" ? source.endpoint.trim().replace(/\/+$/, "") : "";
+    const apiKey = typeof source.apiKey === "string" ? source.apiKey.trim() : "";
+    const account = typeof source.account === "string" ? source.account.trim() : "";
+    const user = typeof source.user === "string" ? source.user.trim() : "";
+    if (!endpoint) errors.push(`${role}.endpoint is required`);
+    if (!apiKey) errors.push(`${role}.apiKey is required`);
+    if (!account) errors.push(`${role}.account is required`);
+    if (!user) errors.push(`${role}.user is required`);
+    if (endpoint) {
+      let parsed;
+      try {
+        parsed = new URL(endpoint);
+      } catch {
+        errors.push(`${role}.endpoint must be an HTTP(S) URL`);
+      }
+      if (parsed && !["http:", "https:"].includes(parsed.protocol)) {
+        errors.push(`${role}.endpoint must be an HTTP(S) URL`);
+      }
+    }
+    routes[role] = {
+      endpoint,
+      baseUrl: endpoint,
+      apiKey,
+      account,
+      user,
+      authMode: "api_key",
+      sendIdentityHeaders: false,
+    };
+  }
+
+  const keys = MEMORY_ROLES.map(role => routes[role]?.apiKey).filter(Boolean);
+  if (new Set(keys).size !== keys.length) errors.push("each route must use a distinct apiKey");
+  if (errors.length) {
+    throw new TypeError(`memoryIsolation requires complete candidate, approved, and history routes: ${errors.join("; ")}.`);
+  }
+  return routes;
 }
