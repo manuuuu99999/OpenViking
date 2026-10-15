@@ -807,6 +807,16 @@ function isExtractionDisabled(result) {
 }
 
 function countMemoryOperations(content) {
+  const operations = parseMemoryDiff(content);
+  if (!operations) return null;
+  return {
+    adds: operations.adds.length,
+    updates: operations.updates.length,
+    deletes: operations.deletes.length,
+  };
+}
+
+export function parseMemoryDiff(content) {
   let diff = content;
   if (typeof diff === "string") {
     try {
@@ -822,11 +832,7 @@ function countMemoryOperations(content) {
   if (!["adds", "updates", "deletes"].every(key => Array.isArray(operations[key]))) {
     return null;
   }
-  return {
-    adds: operations.adds.length,
-    updates: operations.updates.length,
-    deletes: operations.deletes.length,
-  };
+  return operations;
 }
 
 function wait(timeoutMs) {

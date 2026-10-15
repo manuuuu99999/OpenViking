@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 
 import { extractTextFromContent } from "./shared/capture-utils.mjs";
 import { stateDir } from "./shared/workspace-identity.mjs";
+import { parseMemoryDiff } from "./runtime.mjs";
 
 const PROPOSAL_FILE = "review-proposals.json";
 const PROPOSAL_TOOL_PREFIX = "openviking_";
@@ -98,6 +99,7 @@ async function prepareProposal({ args, signal, runtime, candidateClient, approve
       id: proposalId(segment.projectId, segment.segmentId),
       status: "question",
       pendingReason: "project_scope_unverified",
+      question: `Solo se ha comprobado el proyecto ${segment.projectId}. ¿Quieres revisar la propuesta limitada a ese proyecto?`,
     });
     await store.save(question);
     return question;
@@ -123,6 +125,10 @@ async function prepareProposal({ args, signal, runtime, candidateClient, approve
       status: evidence.status === "question" ? "question" : "pending",
       pendingReason: evidence.reason,
       ...(evidence.safeAssertion ? { assertion: evidence.safeAssertion } : {}),
+      ...(evidence.question ? { question: evidence.question } : {}),
+      ...(evidence.originalPassage ? { originalPassage: evidence.originalPassage } : {}),
+      ...(evidence.approvedPrevious ? { approvedPrevious: evidence.approvedPrevious } : {}),
+      ...(evidence.failure ? { failure: evidence.failure } : {}),
     });
     await store.save(pending);
     return pending;
@@ -170,7 +176,9 @@ function proposalOutput() {
     presentationMeta: (_args, value) => ({
       id: value.id || "",
       status: value.status || "pending",
-      title: value.status === "reviewable" ? "Propuesta de memoria" : "Propuesta pendiente de comprobación",
+      title: value.status === "reviewable"
+        ? "Propuesta de memoria"
+        : value.status === "question" ? "Pregunta para revisar" : "Propuesta pendiente de comprobación",
     }),
   };
 }
@@ -189,21 +197,25 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
   const diffUri = segment.extraction?.memoryDiffUri;
   if (!archiveUri || !diffUri) return { ok: false, reason: "source_or_extraction_reference_missing" };
 
-  const archive = await readContent(candidateClient, `${archiveUri}/messages.jsonl`, signal);
-  if (!archive.ok) return { ok: false, reason: "original_unavailable" };
-  const diff = await readContent(candidateClient, diffUri, signal);
-  if (!diff.ok) return { ok: false, reason: "candidate_diff_unavailable" };
-  const parsedDiff = parseDiff(diff.value);
-  if (!parsedDiff) return { ok: false, reason: "candidate_diff_incomplete" };
-  const additions = parsedDiff.operations.adds;
+  const archive = await readContent(candidateClient, `${archiveUri}/messages.jsonl`, signal, "original_archive");
+  if (!archive.ok) return { ok: false, reason: "original_unavailable", failure: archive.failure };
+  const diff = await readContent(candidateClient, diffUri, signal, "candidate_diff");
+  if (!diff.ok) return { ok: false, reason: "candidate_diff_unavailable", failure: diff.failure };
+  const operations = parseMemoryDiff(diff.value);
+  if (!operations) return { ok: false, reason: "candidate_diff_incomplete" };
+  const additions = operations.adds;
   if (additions.length !== 1 || typeof additions[0]?.uri !== "string") {
     return { ok: false, reason: "candidate_set_is_not_unambiguous" };
   }
 
   const candidateUri = additions[0].uri;
-  const candidate = await readContent(candidateClient, candidateUri, signal);
+  const candidate = await readContent(candidateClient, candidateUri, signal, "candidate_memory");
   if (!candidate.ok || typeof candidate.value !== "string" || !candidate.value.trim()) {
-    return { ok: false, reason: "candidate_unavailable" };
+    return {
+      ok: false,
+      reason: "candidate_unavailable",
+      ...(candidate.failure ? { failure: candidate.failure } : {}),
+    };
   }
   const candidateText = candidate.value.trim();
   const originalPassage = findOriginalPassage(archive.value, candidateText, segment.eventCoverage);
@@ -223,45 +235,89 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
   );
   let approvedPrevious = { status: "none", text: "" };
   if (approvedResponse.ok) {
-    if (typeof approvedResponse.result !== "string") return { ok: false, reason: "approved_previous_unreadable" };
+    if (typeof approvedResponse.result !== "string") {
+      return {
+        ok: false,
+        reason: "approved_previous_unreadable",
+        failure: failureDetails("approved_memory", { ...approvedResponse, error: null }),
+      };
+    }
     approvedPrevious = { status: "found", text: approvedResponse.result };
   } else if (approvedResponse.status !== 404 && approvedResponse.error?.code !== "NOT_FOUND") {
-    return { ok: false, reason: "approved_lookup_failed" };
+    return {
+      ok: false,
+      reason: "approved_lookup_failed",
+      failure: failureDetails("approved_memory", approvedResponse),
+    };
   }
 
   const filterProblem = await hasKnownSecret(candidateText, originalPassage, approvedPrevious.text);
   if (filterProblem) return { ok: false, reason: filterProblem };
   if (approvedPrevious.status === "found" && approvedPrevious.text.trim() !== candidateText) {
-    return { ok: false, status: "question", reason: "possible_approved_contradiction", safeAssertion: candidateText };
+    return {
+      ok: false,
+      status: "question",
+      reason: "possible_approved_contradiction",
+      safeAssertion: candidateText,
+      originalPassage,
+      approvedPrevious,
+      question: `La afirmación extraída («${candidateText}») contradice lo aprobado («${approvedPrevious.text}»). ¿Quieres revisar esta diferencia? No se ha modificado la memoria aprobada.`,
+    };
   }
   if (approvedPrevious.status === "found") {
-    return { ok: false, status: "question", reason: "already_approved_no_change", safeAssertion: candidateText };
+    return {
+      ok: false,
+      status: "question",
+      reason: "already_approved_no_change",
+      safeAssertion: candidateText,
+      originalPassage,
+      approvedPrevious,
+      question: "Esta afirmación ya está aprobada sin cambios. ¿Quieres cerrar la revisión sin preparar otra alta?",
+    };
   }
   return { ok: true, candidateUri, candidateText, originalPassage, approvedPrevious };
 }
 
-async function readContent(client, uri, signal) {
+async function readContent(client, uri, signal, source) {
   try {
     const response = await client.fetchJSON(
       `/api/v1/content/read?uri=${encodeURIComponent(uri)}`,
       {},
       { signal },
     );
-    if (!response.ok || typeof response.result !== "string") return { ok: false };
+    if (!response.ok || typeof response.result !== "string") {
+      return { ok: false, failure: failureDetails(source, response) };
+    }
     return { ok: true, value: response.result };
-  } catch {
-    return { ok: false };
+  } catch (error) {
+    return {
+      ok: false,
+      failure: {
+        source,
+        status: 0,
+        code: error?.name === "AbortError" ? "TIMEOUT" : "NETWORK_ERROR",
+      },
+    };
   }
 }
 
-function parseDiff(value) {
-  let diff = value;
-  if (typeof diff === "string") {
-    try { diff = JSON.parse(diff); } catch { return null; }
-  }
-  const operations = diff?.operations;
-  if (!operations || !["adds", "updates", "deletes"].every(key => Array.isArray(operations[key]))) return null;
-  return { operations };
+function failureDetails(source, response) {
+  const status = Number.isInteger(response.status) ? response.status : 0;
+  const code = typeof response.error?.code === "string"
+    ? response.error.code
+    : response.error?.aborted
+      ? "TIMEOUT"
+      : status === 0
+        ? "NETWORK_ERROR"
+        : response.ok
+          ? "INVALID_RESPONSE"
+          : "REQUEST_FAILED";
+  return {
+    source,
+    status,
+    code,
+    ...(response.traceId ? { traceId: response.traceId } : {}),
+  };
 }
 
 function findOriginalPassage(archive, candidateText, eventCoverage = []) {
@@ -350,6 +406,8 @@ function proposalMetadata(segment) {
     originalPassage: "",
     approvedPrevious: { status: "unknown", text: "" },
     proposedText: "",
+    question: "",
+    failure: null,
     reasonSuggested: "",
     effect: "",
     filterNote: "El filtro busca formatos conocidos de credenciales; no detecta todo texto sensible.",
@@ -367,6 +425,8 @@ function pendingProposal(fields) {
     originalPassage: "",
     approvedPrevious: { status: "unknown", text: "" },
     proposedText: "",
+    question: "",
+    failure: null,
     reasonSuggested: "",
     effect: "",
     filterNote: "El filtro busca formatos conocidos de credenciales; no detecta todo texto sensible.",
@@ -388,9 +448,20 @@ function renderProposal(proposal) {
     `**Motivo sugerido:** ${proposal.reasonSuggested || "no disponible"}`,
     `**Efecto previsto:** ${proposal.effect || "no comprobado"}`,
     `**Pendiente:** ${proposal.pendingReason || "no"}`,
+    ...(proposal.question ? [`**Pregunta para Sergi:** ${proposal.question}`] : []),
+    ...(proposal.failure ? [`**Fallo de comprobación:** ${renderFailure(proposal.failure)}`] : []),
     `**Límite del filtro:** ${proposal.filterNote}`,
   ];
   return lines.join("\n\n");
+}
+
+function renderFailure(failure) {
+  return [
+    failure.source,
+    failure.status ? `HTTP ${failure.status}` : "",
+    failure.code,
+    failure.traceId ? `traza ${failure.traceId}` : "",
+  ].filter(Boolean).join(" · ");
 }
 
 function proposalId(projectId, segmentId, candidateUri = "") {

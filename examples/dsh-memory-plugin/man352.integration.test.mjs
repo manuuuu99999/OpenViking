@@ -38,6 +38,7 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
   process.env.OPENVIKING_PENDING_DIR = join(stateDir, "pending");
   const serverCalls = [];
   const archivedMessages = [];
+  const approvedMemories = new Map();
   const taskPlans = new Map();
   const commitPlans = [
     { archiveUri: ARCHIVE_URI, diffUri: DIFF_URI, candidateUri: CANDIDATE_URI },
@@ -92,7 +93,7 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
         return response(archivedMessages.map(value => JSON.stringify(value)).join("\n"));
       }
       if (uri === `${MISSING_ARCHIVE_URI}/messages.jsonl`) {
-        return response({ code: "NOT_FOUND" }, 404);
+        return response({ code: "NOT_FOUND", trace_id: "trace-missing-archive" }, 404);
       }
       if (uri === DIFF_URI) {
         return response(JSON.stringify({ operations: { adds: [{ uri: CANDIDATE_URI }], updates: [], deletes: [] } }));
@@ -107,8 +108,17 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
       if (uri === CANDIDATE_URI && approvedPrevious) return response(approvedPrevious);
       return response({ code: "NOT_FOUND" }, 404);
     }
+    if (parsed.pathname === "/api/v1/content/write" && route === "approved" && method === "POST") {
+      const body = JSON.parse(init.body);
+      approvedMemories.set(body.uri, body.content);
+      return response({});
+    }
     if (parsed.pathname === "/api/v1/search/search" && route === "approved") {
-      return response({ items: [] });
+      const query = String(JSON.parse(init.body).query || "").toLowerCase();
+      const items = [...approvedMemories.entries()]
+        .filter(([, content]) => String(content).toLowerCase().includes(query))
+        .map(([memoryUri, content]) => ({ uri: memoryUri, content }));
+      return response({ items });
     }
     return response({ code: "UNEXPECTED_FIXTURE_REQUEST" }, 500);
   };
@@ -194,6 +204,17 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     assert.match(view.content, /lunes/);
     assert.match(view.content, /pasaje original comprobado/i);
 
+    const approvedClient = new OpenVikingClient({ ...ROUTES.approved, requestTimeoutMs: 10000 });
+    const search = await approvedClient.fetchJSON("/api/v1/search/search", {
+      method: "POST",
+      body: JSON.stringify({ query: CANDIDATE }),
+    });
+    assert.deepEqual(search.result.items, []);
+    assert.equal(approvedMemories.has(CANDIDATE_URI), false);
+    assert.equal(serverCalls.some(call => call.method === "POST" && call.path === "/api/v1/content/write"), false);
+    assert.ok(serverCalls.some(call => call.route === "candidate" && call.uri === `${ARCHIVE_URI}/messages.jsonl`));
+    assert.ok(serverCalls.some(call => call.route === "approved" && call.uri === CANDIDATE_URI));
+
     const crossProject = await callTool(ctx, "openviking_review_proposal", {
       segmentId: SEGMENT_ID,
       targetProjects: [PROJECT_ID, "unverified-project"],
@@ -201,6 +222,7 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     assert.equal(crossProject.value.status, "question");
     assert.equal(crossProject.value.pendingReason, "project_scope_unverified");
     assert.equal(crossProject.value.proposedText, "");
+    assert.match(crossProject.value.question, /\?/u);
     assert.match(crossProject.value.filterNote, /El filtro busca/i);
     assert.doesNotMatch(crossProject.value.filterNote, /Se comprobaron/i);
 
@@ -208,18 +230,18 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     const contradiction = await callTool(ctx, "openviking_review_proposal", { segmentId: SEGMENT_ID });
     assert.equal(contradiction.value.status, "question");
     assert.equal(contradiction.value.pendingReason, "possible_approved_contradiction");
+    assert.equal(contradiction.value.approvedPrevious.status, "found");
+    assert.equal(contradiction.value.approvedPrevious.text, approvedPrevious);
+    assert.equal(contradiction.value.originalPassage, SOURCE);
     assert.equal(contradiction.value.proposedText, "");
+    assert.match(contradiction.value.question, /¿.*\?/u);
+    const contradictionView = presenter.presentResult(
+      { segmentId: SEGMENT_ID },
+      { content: contradiction.content, isError: false, meta: contradiction.meta },
+    );
+    assert.match(contradictionView.title, /pregunta/i);
+    assert.match(contradictionView.content, /martes/);
     approvedPrevious = "";
-
-    const approvedClient = new OpenVikingClient({ ...ROUTES.approved, requestTimeoutMs: 10000 });
-    const search = await approvedClient.fetchJSON("/api/v1/search/search", {
-      method: "POST",
-      body: JSON.stringify({ query: CANDIDATE }),
-    });
-    assert.deepEqual(search.result.items, []);
-    assert.equal(serverCalls.some(call => call.method === "POST" && call.path === "/api/v1/content/write"), false);
-    assert.ok(serverCalls.some(call => call.route === "candidate" && call.uri === `${ARCHIVE_URI}/messages.jsonl`));
-    assert.ok(serverCalls.some(call => call.route === "approved" && call.uri === CANDIDATE_URI));
 
     const unrelatedEvent = {
       id: "synthetic-event-2",
@@ -330,7 +352,18 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     const missing = await callTool(ctx, "openviking_review_proposal", { segmentId: missingSegmentId });
     assert.equal(missing.value.status, "pending");
     assert.equal(missing.value.pendingReason, "original_unavailable");
+    assert.deepEqual(missing.value.failure, {
+      source: "original_archive",
+      status: 404,
+      code: "NOT_FOUND",
+      traceId: "trace-missing-archive",
+    });
     assert.equal(missing.value.originalPassage, "");
+    const missingView = presenter.presentResult(
+      { segmentId: missingSegmentId },
+      { content: missing.content, isError: false, meta: missing.meta },
+    );
+    assert.match(missingView.content, /HTTP 404.*NOT_FOUND/);
   } finally {
     for (const dispose of fixture.cleanups.reverse()) await dispose();
     await toolsFiber.dispose();
