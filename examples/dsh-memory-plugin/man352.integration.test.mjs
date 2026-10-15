@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
+import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +11,7 @@ import { apply as applyOpenViking } from "./index.mjs";
 import { OpenVikingClient } from "./client.mjs";
 
 const SOURCE = "La conversación inventada confirma: el equipo revisa los cambios cada lunes.";
+const NEGATED_SOURCE = "La conversación inventada aclara: no es cierto que el equipo revisa los cambios cada lunes.";
 const CANDIDATE = "el equipo revisa los cambios cada lunes.";
 const CANDIDATE_URI = "viking://~/memories/entities/man352-review-cadence.md";
 const ARCHIVE_URI = "viking://~/sessions/man352-session/archive";
@@ -48,6 +50,7 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     { archiveUri: MISSING_ARCHIVE_URI, diffUri: DIFF_URI, candidateUri: CANDIDATE_URI },
   ];
   let approvedPrevious = "";
+  let missingArchiveMessage = "Archive path was not found.";
   globalThis.fetch = async (url, init = {}) => {
     const parsed = new URL(url);
     const token = new Headers(init.headers).get("authorization") || "";
@@ -93,7 +96,11 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
         return response(archivedMessages.map(value => JSON.stringify(value)).join("\n"));
       }
       if (uri === `${MISSING_ARCHIVE_URI}/messages.jsonl`) {
-        return response({ code: "NOT_FOUND", trace_id: "trace-missing-archive" }, 404);
+        return response({
+          code: "NOT_FOUND",
+          message: missingArchiveMessage,
+          trace_id: "trace-missing-archive",
+        }, 404);
       }
       if (uri === DIFF_URI) {
         return response(JSON.stringify({ operations: { adds: [{ uri: CANDIDATE_URI }], updates: [], deletes: [] } }));
@@ -175,6 +182,23 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     assert.equal(listed.value.segments[0].archiveStatus, "confirmed");
     assert.equal(listed.value.segments[0].extractionStatus, "completed_non_empty");
 
+    const unavailableFilterHooks = registerHooks({
+      resolve(specifier, context, nextResolve) {
+        if (specifier === "./known-secret-filter.mjs" && context.parentURL?.endsWith("/proposal-tools.mjs")) {
+          throw new Error("Synthetic filter unavailable.");
+        }
+        return nextResolve(specifier, context);
+      },
+    });
+    let withoutFilter;
+    try {
+      withoutFilter = await callTool(ctx, "openviking_review_proposal", { segmentId: SEGMENT_ID });
+    } finally {
+      unavailableFilterHooks.deregister();
+    }
+    assert.equal(withoutFilter.value.status, "pending");
+    assert.equal(withoutFilter.value.pendingReason, "secret_filter_unavailable");
+
     const prepared = await callTool(ctx, "openviking_review_proposal", { segmentId: SEGMENT_ID });
     assert.equal(prepared.isError, false, JSON.stringify(prepared.error));
     assert.equal(prepared.value.status, "reviewable", JSON.stringify(prepared.value));
@@ -194,6 +218,19 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     assert.equal(opened.isError, false, JSON.stringify(opened.error));
     assert.equal(opened.value.id, prepared.value.id);
     assert.equal(opened.value.originalPassage, SOURCE);
+    const agentOutput = opened.content.map(part => part.text || "").join("\n");
+    for (const visible of [PROJECT_ID, SESSION_ID, SEGMENT_ID, CANDIDATE, SOURCE]) {
+      assert.ok(agentOutput.includes(visible), `the agent output must show ${visible}`);
+    }
+    for (const label of [
+      /afirmación/i,
+      /pasaje original comprobado/i,
+      /cobertura/i,
+      /aprobado anterior/i,
+      /texto propuesto/i,
+      /motivo sugerido/i,
+      /efecto previsto/i,
+    ]) assert.match(agentOutput, label);
     const presenter = ctx.tools.get("openviking_review_proposal");
     const view = presenter.presentResult(
       { proposalId: prepared.value.id },
@@ -202,7 +239,18 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     assert.equal(view.card, "generic");
     assert.match(view.title, /propuesta/i);
     assert.match(view.content, /lunes/);
-    assert.match(view.content, /pasaje original comprobado/i);
+    for (const visible of [PROJECT_ID, SESSION_ID, SEGMENT_ID, CANDIDATE, SOURCE]) {
+      assert.ok(view.content.includes(visible), `the review view must show ${visible}`);
+    }
+    for (const label of [
+      /afirmación/i,
+      /pasaje original comprobado/i,
+      /cobertura/i,
+      /aprobado anterior/i,
+      /texto propuesto/i,
+      /motivo sugerido/i,
+      /efecto previsto/i,
+    ]) assert.match(view.content, label);
 
     const approvedClient = new OpenVikingClient({ ...ROUTES.approved, requestTimeoutMs: 10000 });
     const search = await approvedClient.fetchJSON("/api/v1/search/search", {
@@ -243,14 +291,14 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
     assert.match(contradictionView.content, /martes/);
     approvedPrevious = "";
 
-    const unrelatedEvent = {
+    const negatedEvent = {
       id: "synthetic-event-2",
       type: "user/message",
       time: Date.now(),
-      data: { role: "user", content: [{ type: "text", text: "La conversación inventada menciona otro tema sin una frecuencia." }], source: { kind: "user" } },
+      data: { role: "user", content: [{ type: "text", text: NEGATED_SOURCE }], source: { kind: "user" } },
     };
-    session.events.push(unrelatedEvent);
-    fixture.handlers.get("session/event")(session, unrelatedEvent);
+    session.events.push(negatedEvent);
+    fixture.handlers.get("session/event")(session, negatedEvent);
     await fixture.handlers.get("session/flush")(session);
     const secondCompaction = { id: "synthetic-compaction-2", type: "compaction/start", data: {} };
     session.events.push(secondCompaction);
@@ -263,10 +311,10 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
         segment.segment === secondSegmentId && segment.extractionStatus === "completed_non_empty"
       ));
     });
-    const unrelated = await callTool(ctx, "openviking_review_proposal", { segmentId: secondSegmentId });
-    assert.equal(unrelated.value.status, "pending");
-    assert.equal(unrelated.value.pendingReason, "original_passage_not_verified");
-    assert.equal(unrelated.value.originalPassage, "");
+    const negated = await callTool(ctx, "openviking_review_proposal", { segmentId: secondSegmentId });
+    assert.equal(negated.value.status, "pending");
+    assert.equal(negated.value.pendingReason, "original_passage_not_verified");
+    assert.equal(negated.value.originalPassage, "");
 
     const secretSession = { id: "synthetic-dsh-secret-session", header: { cwd: "/synthetic/project" }, events: [] };
     const secretAgent = { status: "idle", session: secretSession, inject() {}, ctx: { effect() {} } };
@@ -356,6 +404,7 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
       source: "original_archive",
       status: 404,
       code: "NOT_FOUND",
+      message: "Archive path was not found.",
       traceId: "trace-missing-archive",
     });
     assert.equal(missing.value.originalPassage, "");
@@ -364,6 +413,13 @@ test("DSH prepara y abre una propuesta solo tras cotejar el evento con su archiv
       { content: missing.content, isError: false, meta: missing.meta },
     );
     assert.match(missingView.content, /HTTP 404.*NOT_FOUND/);
+    assert.match(missingView.content, /Archive path was not found\./);
+
+    missingArchiveMessage = `Archive path was not found. ${SECRET}`;
+    const redactedError = await callTool(ctx, "openviking_review_proposal", { segmentId: missingSegmentId });
+    assert.equal(redactedError.value.status, "pending");
+    assert.equal(redactedError.value.failure.message, undefined);
+    assert.equal(JSON.stringify(redactedError.value).includes(SECRET), false);
   } finally {
     for (const dispose of fixture.cleanups.reverse()) await dispose();
     await toolsFiber.dispose();

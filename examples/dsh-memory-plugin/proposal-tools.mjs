@@ -8,6 +8,8 @@ import { parseMemoryDiff } from "./runtime.mjs";
 
 const PROPOSAL_FILE = "review-proposals.json";
 const PROPOSAL_TOOL_PREFIX = "openviking_";
+const PENDING_FILTER_NOTE = "El filtro busca formatos conocidos de credenciales; no detecta todo texto sensible.";
+const COMMON_NEGATION_PATTERN = /\b(?:no|not|never|neither|nor|none|nobody|nothing|without|cannot|can't|couldn't|didn't|doesn't|don't|isn't|aren't|wasn't|weren't|won't|wouldn't|mustn't|sin|nunca|jamás|tampoco|ningún|ninguna|ninguno|ningunos|ningunas|nadie|nada|ni)\b/iu;
 
 /** Mount the separate DSH proposal surface; it never writes to OpenViking. */
 export function mountProposalTools(ctx, { runtime, candidateClient, approvedClient }) {
@@ -157,13 +159,13 @@ async function openProposal(store, id) {
   if (!proposal) {
     return pendingProposal({ id, status: "pending", pendingReason: "proposal_not_found" });
   }
-  const unsafe = await hasKnownSecret(proposal.assertion, proposal.originalPassage, proposal.approvedPrevious?.text);
-  if (unsafe) {
+  const secretFilterProblem = await hasKnownSecret(proposal.assertion, proposal.originalPassage, proposal.approvedPrevious?.text);
+  if (secretFilterProblem) {
     return pendingProposal({
       ...proposalMetadata(proposal),
       id: proposal.id,
       status: "pending",
-      pendingReason: unsafe,
+      pendingReason: secretFilterProblem,
     });
   }
   return proposal;
@@ -239,7 +241,7 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
       return {
         ok: false,
         reason: "approved_previous_unreadable",
-        failure: failureDetails("approved_memory", { ...approvedResponse, error: null }),
+        failure: await failureDetails("approved_memory", { ...approvedResponse, error: null }),
       };
     }
     approvedPrevious = { status: "found", text: approvedResponse.result };
@@ -247,7 +249,7 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
     return {
       ok: false,
       reason: "approved_lookup_failed",
-      failure: failureDetails("approved_memory", approvedResponse),
+      failure: await failureDetails("approved_memory", approvedResponse),
     };
   }
 
@@ -286,7 +288,7 @@ async function readContent(client, uri, signal, source) {
       { signal },
     );
     if (!response.ok || typeof response.result !== "string") {
-      return { ok: false, failure: failureDetails(source, response) };
+      return { ok: false, failure: await failureDetails(source, response) };
     }
     return { ok: true, value: response.result };
   } catch (error) {
@@ -301,7 +303,7 @@ async function readContent(client, uri, signal, source) {
   }
 }
 
-function failureDetails(source, response) {
+async function failureDetails(source, response) {
   const status = Number.isInteger(response.status) ? response.status : 0;
   const code = typeof response.error?.code === "string"
     ? response.error.code
@@ -312,10 +314,15 @@ function failureDetails(source, response) {
         : response.ok
           ? "INVALID_RESPONSE"
           : "REQUEST_FAILED";
+  const message = typeof response.error?.message === "string"
+    ? response.error.message.replace(/\s+/gu, " ").trim().slice(0, 300)
+    : "";
+  const safeMessage = message && !(await hasKnownSecret(message)) ? message : "";
   return {
     source,
     status,
     code,
+    ...(safeMessage ? { message: safeMessage } : {}),
     ...(response.traceId ? { traceId: response.traceId } : {}),
   };
 }
@@ -326,9 +333,40 @@ function findOriginalPassage(archive, candidateText, eventCoverage = []) {
     .filter(hash => typeof hash === "string" && /^[a-f0-9]{64}$/u.test(hash)));
   if (sourceHashes.size === 0) return "";
 
-  const sources = extractArchiveTexts(archive)
-    .filter(text => sourceHashes.has(createHash("sha256").update(text).digest("hex")));
-  return sources.find(text => text.includes(candidateText)) || "";
+  for (const text of extractArchiveTexts(archive)) {
+    if (!sourceHashes.has(createHash("sha256").update(text).digest("hex"))) continue;
+    let matchIndex = text.indexOf(candidateText);
+    while (matchIndex >= 0) {
+      if (!hasNegationOutsideCandidate(text, matchIndex, candidateText)) return text;
+      matchIndex = text.indexOf(candidateText, matchIndex + 1);
+    }
+  }
+  return "";
+}
+
+function hasNegationOutsideCandidate(source, candidateStart, candidateText) {
+  const candidateEnd = candidateStart + candidateText.length;
+  const sentenceStart = findPreviousSentenceBoundary(source, candidateStart);
+  const sentenceEnd = findNextSentenceBoundary(source, candidateEnd);
+  const context = [
+    source.slice(sentenceStart, candidateStart),
+    source.slice(candidateEnd, sentenceEnd),
+  ].join(" ");
+  return COMMON_NEGATION_PATTERN.test(context);
+}
+
+function findPreviousSentenceBoundary(text, index) {
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    if (/[.!?。！？;\n]/u.test(text[cursor])) return cursor + 1;
+  }
+  return 0;
+}
+
+function findNextSentenceBoundary(text, index) {
+  for (let cursor = index; cursor < text.length; cursor += 1) {
+    if (/[.!?。！？;\n]/u.test(text[cursor])) return cursor;
+  }
+  return text.length;
 }
 
 function extractArchiveTexts(archive) {
@@ -410,7 +448,7 @@ function proposalMetadata(segment) {
     failure: null,
     reasonSuggested: "",
     effect: "",
-    filterNote: "El filtro busca formatos conocidos de credenciales; no detecta todo texto sensible.",
+    filterNote: PENDING_FILTER_NOTE,
   };
 }
 
@@ -429,7 +467,7 @@ function pendingProposal(fields) {
     failure: null,
     reasonSuggested: "",
     effect: "",
-    filterNote: "El filtro busca formatos conocidos de credenciales; no detecta todo texto sensible.",
+    filterNote: PENDING_FILTER_NOTE,
     ...fields,
   };
 }
@@ -460,6 +498,7 @@ function renderFailure(failure) {
     failure.source,
     failure.status ? `HTTP ${failure.status}` : "",
     failure.code,
+    failure.message || "",
     failure.traceId ? `traza ${failure.traceId}` : "",
   ].filter(Boolean).join(" · ");
 }
