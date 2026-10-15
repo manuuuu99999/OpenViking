@@ -145,9 +145,10 @@ context sends no search request.
 ### How the tool surface is mounted
 
 `mcp.mjs` mounts `@deepseek-ai/dsh-mcp-client` on `servers/mcp-proxy.mjs`, the
-same stdio proxy every other OpenViking memory integration starts, so the model
-gets the server's full tool set instead of a hand-maintained subset and the
-transport behaves identically across harnesses. Pointing the bridge straight at
+same stdio proxy every other OpenViking memory integration starts. Without
+`memoryIsolation`, the model gets the server's full tool set. With isolation,
+separate approved and history bridges expose only read-only tools; the proxy
+also rejects direct calls to tools outside that list. Pointing the bridge straight at
 the server's `/mcp` endpoint does not work: with `stateless_http=True` the
 server still answers `GET /mcp` with an idle 200 SSE stream, and once the MCP
 SDK client opens that standalone stream it stops resolving POST responses, so
@@ -162,13 +163,14 @@ no config file and reaches the server exactly as the runtime does, including
 with no key when the runtime has none. A changed `ovcli.conf` therefore takes
 effect for the tools when DSH restarts the bundle, as it does for the runtime.
 
-Two consequences follow from the proxy being one process per profile:
-
-- **MCP actor scope is process-level.** With the default `recallPeerScope: all`, MCP tool calls omit the actor peer header. With `actor`, they use the peer resolved at boot. Automatic recall, capture, and commit resolve their peer from each session's workspace.
-- **`remember` is not session-scoped.** The server's MCP `remember` stores into
-  its own short-lived session rather than the live `dsh-<session-id>` stream —
-  the same behavior the Claude Code, Codex, and Cursor integrations have.
-  Automatic capture still records the conversation itself.
+Without isolation, the proxy is one process per profile. With the default
+`recallPeerScope: all`, MCP tool calls omit the actor peer header. With `actor`,
+they use the peer resolved at boot. Automatic recall, capture, and commit
+resolve their peer from each session's workspace. Without isolation, MCP
+`remember` stores into its own short-lived session rather than the live
+`dsh-<session-id>` stream; automatic capture still records the conversation.
+With isolation, two read-only proxy processes use approved and history
+credentials respectively; `remember` is unavailable.
 
 The bridge and the skill provider are mounted last in `apply()`, after every
 lifecycle registration, so a proxy that cannot start holds up nothing above it.
@@ -202,7 +204,26 @@ Common environment variables:
 | `OPENVIKING_WORKSPACE_PEER` | Derive a peer from each DSH session workspace's git identity by default; `0` sends no peer |
 | `OPENVIKING_RECALL_PEER_SCOPE` | `all` for cross-workspace recall or `actor` for isolation |
 
-The profile's `cordis.patch.yml` can also carry plugin config:
+The profile's `cordis.patch.yml` can also carry plugin config. The optional
+`memoryIsolation` mode is a DSH host input for a **test project**, not a shared
+behavior setting or a replacement for the normal credential chain. It must
+supply all three distinct API keys, HTTP(S) endpoints, account names and user
+names at once; partial input raises an error rather than falling back to legacy
+memory. The candidate connection is resolved through the shared host-input
+connection path. Keep every key outside the agent's messages and tools, and do
+not put live or publication credentials into a repository. In the synthetic
+fixture, the `config` field of the DSH Cordis patch would contain this
+fragment (illustration only, never use it with live credentials):
+
+```yaml
+memoryIsolation:
+  candidate: { endpoint: "http://127.0.0.1:<disposable-port>", apiKey: "<synthetic-candidate-key>", account: "man350_project_a", user: "candidate" }
+  approved: { endpoint: "http://127.0.0.1:<disposable-port>", apiKey: "<synthetic-approved-key>", account: "man350_project_a", user: "approved" }
+  history: { endpoint: "http://127.0.0.1:<disposable-port>", apiKey: "<synthetic-history-key>", account: "man350_project_a", user: "history" }
+```
+
+Do not install this sample in an active DSH profile. The normal host config
+still works without isolation:
 
 ```yaml
 - id: openviking-memory-runtime
@@ -268,18 +289,17 @@ The shared loader also applies `config.local.json` and machine registry override
 
 ## Tools
 
-The model sees the OpenViking MCP tools under the bridge's server-qualified
-names — `mcp__openviking__search`, `mcp__openviking__read`,
-`mcp__openviking__list`, `mcp__openviking__tree`, `mcp__openviking__grep`,
-`mcp__openviking__glob`, `mcp__openviking__remember`,
-`mcp__openviking__write`, `mcp__openviking__edit`,
-`mcp__openviking__forget`, `mcp__openviking__add_resource`,
-`mcp__openviking__add_skill`, and the rest of whatever the connected server
-advertises. The list re-syncs when the server announces a change, so a server
-upgrade adds tools without a bundle release.
+Without `memoryIsolation`, the model sees the server's full OpenViking MCP tool
+surface under `mcp__openviking__*`; the list re-syncs when the server changes.
+With `memoryIsolation`, it sees only `find`, `search`, `read`, `list`, `tree`,
+`grep`, `glob`, and `health` under `mcp__openviking__*` (approved) and
+`mcp__openviking_history__*` (deliberate historical lookup). The proxy refuses
+direct calls to any unlisted tool, including `write` and `remember`. No
+candidate or publication bridge is mounted. A historical tool result also
+adds a warning that its contents are not current approved knowledge.
 
-`mcp__openviking__forget` performs permanent deletion. The calling model should
-use it only when the user explicitly requests deletion.
+Outside isolation, `mcp__openviking__forget` performs permanent deletion. The
+calling model should use it only when the user explicitly requests deletion.
 
 The bundle also serves the shared `openviking-memory` and `openviking-skills`
 skills from `skills/` through its own isolated `ctx.skills` provider, so the
@@ -293,6 +313,30 @@ npm ci          # installs the exact-pinned dsh devDependencies the tests exerci
 npm run check   # syntax check every shipped module + package/PLUGIN_VERSION agreement
 npm test        # node --test *.test.mjs — runs in the repo's PR workflow
 ```
+
+### Reproduce MAN-350 without touching active memory
+
+Use a separate Python environment with the official `openviking==0.5.0` wheel
+(`python -m venv <isolated-venv>` and `<isolated-venv>/Scripts/python -m pip
+install openviking==0.5.0` on Windows). Create an empty, disposable directory
+named `ov-man350-test` **outside** the active OpenViking data and DSH profile.
+Set `MAN350_SYNTHETIC_ROOT` to its absolute path, then start
+`<isolated-venv>/Scripts/python -u test-fixture/serve_synthetic.py` from this
+package directory. On other platforms use `<isolated-venv>/bin/python`.
+Wait for `Synthetic OpenViking ready at ...; identities: ...`; no real keys or
+models are used. Only the embedding/text models are deterministic substitutes;
+synthetic long-term extraction produces no new memories. The installed
+OpenViking server handles storage, identities, HTTP routes and authorization.
+This test proves captured session content and access boundaries, **not** real
+model-driven memory extraction. Keep the process alive for the test; set
+`MAN350_SYNTHETIC_MANIFEST` to the printed absolute `identities.json` path and
+run `node --test --test-isolation=none man350.integration.test.mjs` from this
+package directory. The test rejects a manifest outside the disposable root,
+non-loopback endpoints and the usual active-service port 1933. Stop that
+specific server process after the test and check its port closed. The
+`run-<id>` directory contains **synthetic keys**: do not commit or copy it
+into an active profile. The regular `npm test` intentionally skips this opt-in
+test instead of contacting a configured service.
 
 The `0.3.2` compatibility check installed the packed bundle through
 `dsh plugin add` in isolated profiles and exercised DSH `0.1.0-rc.6`,

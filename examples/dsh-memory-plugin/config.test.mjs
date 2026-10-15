@@ -151,6 +151,8 @@ test("isolated candidate route replaces the legacy connection without sharing it
   assert.equal(config.account, "project-a");
   assert.equal(config.user, "candidate");
   assert.equal(config.authMode, "api_key");
+  // The common resolver reports chain mode separately from the actual key source.
+  assert.equal(config.apiKeySource, "host");
   assert.equal(config.memoryIsolation.approved.apiKey, "approved-key");
   assert.equal(config.memoryIsolation.history.apiKey, "history-key");
 });

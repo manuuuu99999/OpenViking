@@ -1,7 +1,7 @@
 import { buildPluginConfig } from "./shared/plugin-config.mjs";
 import { CREDENTIAL_ENV_VARS, loadCredentialFiles } from "./shared/credentials.mjs";
 
-export const PLUGIN_VERSION = "0.5.25";
+export const PLUGIN_VERSION = "0.5.26";
 
 /**
  * Namespace for the bridged OpenViking MCP tools. DSH publishes every MCP tool
@@ -26,6 +26,13 @@ export function resolveConfig(input = {}, env = process.env, cwd = process.cwd()
   // ov.conf's `dsh` section is the legacy layer here as everywhere else, but
   // the cordis patch shares that slot; the host named this process's settings,
   // so it wins the overlap.
+  // Route credentials are explicit host inputs, not behavioral knobs read from
+  // shared configuration files. Keep the candidate connection inside the common
+  // connection resolver so it reports the same provenance as other host inputs.
+  const memoryIsolation = Object.prototype.hasOwnProperty.call(input, "memoryIsolation")
+    ? normalizeMemoryIsolation(input.memoryIsolation)
+    : null;
+  const candidate = memoryIsolation?.candidate;
   const ovSection = loadCredentialFiles(env).ovFile.dsh;
   const config = buildPluginConfig("dsh", {
     env,
@@ -34,34 +41,17 @@ export function resolveConfig(input = {}, env = process.env, cwd = process.cwd()
     version: PLUGIN_VERSION,
     hostInput: {
       peerId: input.peerId,
-      account: input.account,
-      user: input.user,
-      apiKey: input.apiKey,
-      baseUrl: input.endpoint,
+      account: candidate?.account ?? input.account,
+      user: candidate?.user ?? input.user,
+      apiKey: candidate?.apiKey ?? input.apiKey,
+      baseUrl: candidate?.endpoint ?? input.endpoint,
       // The legacy knob layer this used to ride accepted both spellings.
-      authMode: input.authMode || input.auth_mode,
+      authMode: candidate?.authMode ?? input.authMode ?? input.auth_mode,
     },
     deriveEffectivePeer: true,
   });
-  const memoryIsolation = Object.prototype.hasOwnProperty.call(input, "memoryIsolation")
-    ? normalizeMemoryIsolation(input.memoryIsolation)
-    : null;
-
-  const candidate = memoryIsolation?.candidate;
   return {
     ...config,
-    ...(candidate ? {
-      endpoint: candidate.endpoint,
-      baseUrl: candidate.baseUrl,
-      mcpUrl: `${candidate.endpoint}/mcp`,
-      apiKey: candidate.apiKey,
-      account: candidate.account,
-      user: candidate.user,
-      authMode: candidate.authMode,
-      sendIdentityHeaders: candidate.sendIdentityHeaders,
-      credentialSource: "memoryIsolation",
-      hasApiKey: true,
-    } : {}),
     peerId: config.effectivePeer.peerId,
     ...(memoryIsolation ? { memoryIsolation } : {}),
   };
