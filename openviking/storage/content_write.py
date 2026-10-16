@@ -96,6 +96,13 @@ from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _valid_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        char in "0123456789abcdef" for char in value
+    )
+
+
 _DERIVED_FILENAMES = frozenset({".relations.json"})
 _CREATE_ALLOWED_EXTENSIONS = frozenset(
     {
@@ -283,6 +290,7 @@ class ContentWriteCoordinator:
         timeout: Optional[float] = None,
         skip_conflicts: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        deleted_uris: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Write a bundle under one directory, then refresh it as a batch.
 
@@ -302,7 +310,9 @@ class ContentWriteCoordinator:
         normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
         )
-        if skip_conflicts and any(op["mode"] == "delete" for op in normalized_operations):
+        if skip_conflicts and any(
+            op["mode"] in {"delete", "reconcile_delete"} for op in normalized_operations
+        ):
             raise InvalidArgumentError("batch-write delete cannot be combined with skip_conflicts")
 
         target_paths = [
@@ -320,7 +330,8 @@ class ContentWriteCoordinator:
         created: list[str] = []
         updated: list[str] = []
         unchanged: list[str] = []
-        deleted: list[str] = []
+        # Share confirmed deletions with the service even if a later refresh raises.
+        deleted = deleted_uris if deleted_uris is not None else []
         refresh_kinds: dict[str, str] = {}
         file_md5s: dict[str, str] = {}
         file_abstracts: dict[str, str] = {}
@@ -345,8 +356,8 @@ class ContentWriteCoordinator:
                 # the requested final body, while append only needs the old
                 # body when it already exists.
                 write_mode = (
-                    "delete"
-                    if requested_mode == "delete"
+                    requested_mode
+                    if requested_mode in {"delete", "reconcile_delete"}
                     else "append"
                     if requested_mode == "append" and exists
                     else "replace"
@@ -360,8 +371,10 @@ class ContentWriteCoordinator:
                 try:
                     if exists and stat.get("isDir"):
                         raise ConflictError(f"Target is a directory: {uri}")
+                    if write_mode == "reconcile_delete" and exists:
+                        raise ConflictError(f"Cannot reconcile a file that exists: {uri}")
                     expected = operation.get("expected_sha256")
-                    if expected is not None:
+                    if expected is not None and write_mode != "reconcile_delete":
                         if not exists:
                             raise ConflictError(f"Expected content no longer exists: {uri}")
                         current = await self._viking_fs.read_file_bytes(uri, ctx=ctx)
@@ -386,7 +399,9 @@ class ContentWriteCoordinator:
                 pending.append((operation, exists, write_mode))
 
             prepared_resources = await self._prepare_batch_resource_plans(
-                pending=[item for item in pending if item[2] != "delete"],
+                pending=[
+                    item for item in pending if item[2] not in {"delete", "reconcile_delete"}
+                ],
                 ctx=ctx,
                 lease=lease,
                 processing_mode=processing_mode,
@@ -396,7 +411,7 @@ class ContentWriteCoordinator:
                     operation["uri"]
                     for operation, existed, mode_ in pending
                     if existed
-                    and mode_ != "delete"
+                    and mode_ not in {"delete", "reconcile_delete"}
                     and context_type_for_uri(operation["uri"]) in {"resource", "skill"}
                     and not is_abstract_overview_uri(operation["uri"])
                     and operation["uri"] not in prepared_resources
@@ -407,7 +422,7 @@ class ContentWriteCoordinator:
             for operation, existed, write_mode in pending:
                 uri = operation["uri"]
                 try:
-                    if write_mode == "delete":
+                    if write_mode in {"delete", "reconcile_delete"}:
                         # Same lease as the history copy and the hash check above.
                         await self._viking_fs.rm(uri, recursive=False, ctx=ctx, lease_ref=lease)
                         deleted.append(uri)
@@ -723,7 +738,7 @@ class ContentWriteCoordinator:
             self._ensure_content_write_policy(uri)
             await self._viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
 
-            if raw.get("mode") == "delete":
+            if raw.get("mode") in {"delete", "reconcile_delete"}:
                 normalized.append(
                     await self._normalize_batch_delete(raw, uri, context_type=context_type, ctx=ctx)
                 )
@@ -760,11 +775,7 @@ class ContentWriteCoordinator:
 
             mode = raw.get("mode", "replace")
             expected = raw.get("expected_sha256")
-            if expected is not None and (
-                not isinstance(expected, str)
-                or len(expected) != 64
-                or any(c not in "0123456789abcdef" for c in expected)
-            ):
+            if expected is not None and not _valid_sha256(expected):
                 raise InvalidArgumentError("expected_sha256 must be a lowercase SHA-256 digest")
             self._validate_batch_mode(mode)
             if has_content_base64 and mode == "append":
@@ -804,7 +815,8 @@ class ContentWriteCoordinator:
         return sorted(
             normalized,
             key=lambda operation: (
-                operation["mode"] == "delete" or operation["expected_sha256"] is not None,
+                operation["mode"] in {"delete", "reconcile_delete"}
+                or operation["expected_sha256"] is not None,
                 operation["uri"],
             ),
         )
@@ -831,11 +843,7 @@ class ContentWriteCoordinator:
         if raw.get("acl") is not None or raw.get("tags") is not None:
             raise InvalidArgumentError(f"batch-write delete takes no acl or tags: {uri}")
         expected = raw.get("expected_sha256")
-        if (
-            not isinstance(expected, str)
-            or len(expected) != 64
-            or any(c not in "0123456789abcdef" for c in expected)
-        ):
+        if not _valid_sha256(expected):
             raise InvalidArgumentError(
                 f"batch-write delete requires a lowercase SHA-256 expected_sha256: {uri}"
             )
@@ -846,7 +854,7 @@ class ContentWriteCoordinator:
         return {
             "uri": uri,
             "content": b"",
-            "mode": "delete",
+            "mode": raw["mode"],
             "expected_sha256": expected,
             "ingest_options": IngestOptions(),
         }

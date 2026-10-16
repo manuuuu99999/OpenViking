@@ -64,9 +64,13 @@ export function createFakeOpenViking({ account = "project-a" } = {}) {
           const failureIndex = failures.findIndex(item => item.method === "BATCH"
             && (!item.uriIncludes || operations.some(op => op.uri.includes(item.uriIncludes))));
           const failure = failureIndex < 0 ? null : failures.splice(failureIndex, 1)[0];
-          if (failure?.stage === "refuse") return respond(false, failure.status || 500, { code: "INTERNAL" });
+          if (failure?.stage === "refuse") return respond(false, failure.status || 500, { code: failure.code || "INTERNAL" });
           failure?.mutate?.(); // another publisher gets in after this caller's preflight
           for (const op of operations) {
+            if (op.mode === "reconcile_delete") {
+              if (resources.has(op.uri)) return respond(false, 409, { code: "CONFLICT" });
+              continue;
+            }
             if (op.expected_sha256 === undefined) continue;
             const existing = resources.get(op.uri);
             const digest = existing ? createHash("sha256").update(existing.content).digest("hex") : null;
@@ -80,7 +84,7 @@ export function createFakeOpenViking({ account = "project-a" } = {}) {
           for (const op of ordered) {
             if (failure?.stage === "afterHistory" && applied === 1) return respond(false, 500, { code: "INTERNAL" });
             if (op.mode === "delete") resources.delete(op.uri);
-            else resources.set(op.uri, { content: op.content, acl: op.acl });
+            else if (op.mode !== "reconcile_delete") resources.set(op.uri, { content: op.content, acl: op.acl });
             applied += 1;
           }
           if (failure?.stage === "afterAll") return respond(false, 0, { code: "NETWORK_ERROR" });

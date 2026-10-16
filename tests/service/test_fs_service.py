@@ -203,6 +203,62 @@ async def test_write_forwards_tags_and_tag_mode_to_content_coordinator(
     assert seen["tag_mode"] == "append"
 
 
+@pytest.mark.asyncio
+async def test_batch_delete_cleans_confirmed_removal_even_if_refresh_fails(monkeypatch, request_context):
+    """A failed batch must not skip the cleanup of a file it already removed."""
+    uri = "viking://resources/demo/approved/memories/old.md"
+    refresh_error = RuntimeError("refresh failed after delete")
+
+    class FailingCoordinator:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def batch_write(self, **kwargs):
+            kwargs["deleted_uris"].append(uri)
+            raise refresh_error
+
+    monkeypatch.setattr("openviking.service.fs_service.ContentWriteCoordinator", FailingCoordinator)
+    service = FSService(viking_fs=object())
+    watch = AsyncMock()
+    links = _FakeResourceMemoryLinkService({"status": "no_references"})
+    monkeypatch.setattr(service, "_sync_watch_after_rm", watch)
+    service._resource_memory_link_service = links
+
+    with pytest.raises(RuntimeError, match="refresh failed after delete") as caught:
+        await service.batch_write(
+            root_uri="viking://resources/demo",
+            operations=[{"uri": uri, "mode": "delete"}],
+            ctx=request_context,
+        )
+
+    assert caught.value is refresh_error
+    watch.assert_awaited_once_with(uri, account_id=request_context.account_id, context_type="resource")
+    assert [call["resource_uri"] for call in links.calls] == [uri]
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_does_not_report_success_when_cleanup_fails(monkeypatch, request_context):
+    uri = "viking://resources/demo/approved/memories/old.md"
+
+    class Coordinator:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def batch_write(self, **kwargs):
+            kwargs["deleted_uris"].append(uri)
+            return {"deleted": [uri]}
+
+    monkeypatch.setattr("openviking.service.fs_service.ContentWriteCoordinator", Coordinator)
+    service = FSService(viking_fs=object())
+    links = _FakeResourceMemoryLinkService({"status": "success", "memory_commit": {"status": "failed"}})
+    service._resource_memory_link_service = links
+    monkeypatch.setattr(service, "_sync_watch_after_rm", AsyncMock(side_effect=RuntimeError("watch unavailable")))
+
+    with pytest.raises(RuntimeError, match="watch unavailable.*memory links"):
+        await service.batch_write(root_uri="viking://resources/demo", operations=[], ctx=request_context)
+    assert [call["resource_uri"] for call in links.calls] == [uri]
+
+
 class _FakeWatchManager:
     def __init__(self, *, events=None):
         self.validate_calls = []

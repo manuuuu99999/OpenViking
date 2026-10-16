@@ -225,7 +225,10 @@ class _OpsMixin:
         This method is idempotent: deleting a non-existent file succeeds
         after cleaning up any orphan index records.
 
-        Acquires a path lock, deletes VectorDB records, then FS files.
+        Acquires a path lock, deletes VectorDB records, then FS files. For a
+        file, restores the original vector records if the backend reports a
+        failure while the file remains. Recursive directory deletes cannot be
+        compensated here because the backend may delete only part of a tree.
         Raises ResourceBusyError when the target is locked by an ongoing
         operation (e.g. semantic processing).
 
@@ -320,24 +323,65 @@ class _OpsMixin:
                 await self._ensure_access_many(uris_to_delete, ctx, action=AclAction.MANAGE)
             real_ctx = self._ctx_or_default(ctx)
             estimated_count = await _estimate_deleted_count(path, real_ctx)
-            await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+            # For a file, snapshot its full records under the same exact lease as
+            # deletion. The backend's strict scan includes the account predicate
+            # and does not silently truncate or omit vector/ACL fields.
+            vector_store = self._get_vector_store()
+            file_records = []
+            if not is_dir and vector_store is not None:
+                file_records, _ = await vector_store._scan_uri_transfer_scope(
+                    real_ctx,
+                    target_uri,
+                    recursive=False,
+                    include_full_records=True,
+                    entry_uris=[target_uri, target_uri + "/"],
+                )
+                if any(
+                    record.get("account_id") != real_ctx.account_id
+                    or record.get("uri") not in (target_uri, target_uri + "/")
+                    or not record.get("id")
+                    for record in file_records
+                ):
+                    raise RuntimeError("Cannot safely snapshot file vector records for deletion")
             try:
+                await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
                 result = await self._async_agfs.rm(
                     path,
                     recursive=recursive,
                     fs_ctx=self._pathlock_fs_ctx(ctx, lease),
                     auto_pathlock=auto_pathlock,
                 )
-            except AGFSDirectoryNotEmptyError:
-                raise InvalidArgumentError(
-                    f"Directory not empty: {uri}. Use recursive=True to delete non-empty directories."
-                )
-            except RuntimeError as e:
-                # Fallback for older versions without typed exceptions
-                if _is_directory_not_empty_error(str(e)):
+            except Exception as deletion_error:
+                if file_records:
+                    try:
+                        # A backend may delete bytes and then report an error.
+                        # Only reinstate vectors when the file still exists.
+                        await self._async_agfs.stat(path)
+                    except Exception as stat_error:
+                        if not is_not_found_error(stat_error):
+                            raise RuntimeError(
+                                "File deletion failed and its remaining bytes could not be "
+                                f"checked: deletion={deletion_error!r}; stat={stat_error!r}"
+                            ) from deletion_error
+                    else:
+                        try:
+                            restored = await vector_store._upsert_many_raw(
+                                file_records, ctx=real_ctx
+                            )
+                            if set(restored) != {str(record["id"]) for record in file_records}:
+                                raise RuntimeError("Vector restoration did not write every record")
+                        except Exception as restore_error:
+                            raise RuntimeError(
+                                "File deletion and vector restoration both failed: "
+                                f"deletion={deletion_error!r}; restoration={restore_error!r}"
+                            ) from deletion_error
+                if isinstance(deletion_error, AGFSDirectoryNotEmptyError) or (
+                    isinstance(deletion_error, RuntimeError)
+                    and _is_directory_not_empty_error(str(deletion_error))
+                ):
                     raise InvalidArgumentError(
                         f"Directory not empty: {uri}. Use recursive=True to delete non-empty directories."
-                    )
+                    ) from deletion_error
                 raise
             # Add estimated_deleted_count to the result
             if isinstance(result, dict):

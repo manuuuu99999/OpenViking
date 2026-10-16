@@ -14,6 +14,7 @@ import {
   normalizeText,
   parseApprovalRecord,
   readPublication,
+  reconcileRetirement,
   sha256,
   sourcesOf,
   stripApprovalRecord,
@@ -261,6 +262,19 @@ async function decideChange(proposal, reason, resuming, exec, {
       return answer("base_version_changed", { uri: targetUri });
     }
     if (state.state === "completed") {
+      if (proposal.change.kind === "retire") {
+        const cleanup = await reconcileRetirement({
+          publisherClient,
+          targetUri,
+          baseHash: proposal.change.base.hash,
+          signal: exec?.signal,
+        });
+        if (!cleanup.ok) return answer("publication_failed", {
+          recoverable: ![400, 401, 403, 422].includes(cleanup.status),
+          stage: "cleanup",
+          failure: { source: "publication", status: cleanup.status, code: cleanup.code },
+        });
+      }
       await store.save({
         ...proposal,
         status: "approved",
@@ -320,11 +334,12 @@ async function decideChange(proposal, reason, resuming, exec, {
       const finished = await settle(after);
       if (finished) return finished;
     }
-    const unsupported = applied.status === 400 || applied.status === 422;
+    const rejectedRequest = applied.status === 400 || applied.status === 422;
     return answer("publication_failed", {
-      recoverable: !unsupported,
+      recoverable: !rejectedRequest && ![401, 403].includes(applied.status),
       stage: applied.stage,
-      ...(unsupported ? { reason: "server_unsupported" } : {}),
+      failure: { source: "publication", status: applied.status, code: applied.code },
+      ...(rejectedRequest ? { reason: "server_rejected_request" } : {}),
     });
   }
   await store.save({

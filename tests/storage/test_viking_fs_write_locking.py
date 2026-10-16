@@ -376,3 +376,161 @@ async def test_directory_mv_reuses_target_tree_for_vector_failure_cleanup(monkey
             "owned": True,
         },
     ]
+
+
+class _RmAGFS:
+    """Retain the file on a failed physical deletion and record lease ordering."""
+
+    def __init__(self, *, fail=False, fail_after_delete=False, events=None):
+        self.exists = True
+        self.fail = fail
+        self.fail_after_delete = fail_after_delete
+        self.events = events if events is not None else []
+
+    async def stat(self, path):
+        if not self.exists:
+            raise FileNotFoundError(path)
+        return {"isDir": False}
+
+    async def pathlock_acquire_exact(self, path):
+        self.events.append("acquire")
+        return {"lease_ref": "rm-lease"}
+
+    async def pathlock_release(self, lease):
+        self.events.append("release")
+
+    async def rm(self, path, *, recursive=False, fs_ctx=None, auto_pathlock=True):
+        self.events.append("physical-delete")
+        if self.fail:
+            raise OSError("physical deletion failed")
+        self.exists = False
+        if self.fail_after_delete:
+            raise OSError("backend failed after removing bytes")
+        return {"deleted": True}
+
+
+class _RmVectors:
+    """Model tenant-scoped records and exact-URI deletion at the vector boundary."""
+
+    def __init__(self, uri, ctx, events, *, fail_restore=False):
+        self.uri = uri
+        self.events = events
+        self.fail_restore = fail_restore
+        self.records = {
+            "record-1": {
+                "id": "record-1",
+                "uri": uri,
+                "account_id": ctx.account_id,
+                "abstract": "approved result",
+                "acl_read_users": ["reader"],
+            }
+        }
+
+    async def count(self, *, filter, ctx):
+        return len(self.records)
+
+    async def _scan_uri_transfer_scope(
+        self, ctx, uri, *, recursive, include_full_records, entry_uris
+    ):
+        self.events.append("snapshot")
+        assert not recursive and include_full_records
+        assert self.uri in entry_uris
+        return [dict(record) for record in self.records.values() if record["account_id"] == ctx.account_id], 1
+
+    async def delete_uris(self, ctx, uris):
+        self.events.append("vector-delete")
+        for key, record in list(self.records.items()):
+            if record["account_id"] == ctx.account_id and record["uri"] in uris:
+                del self.records[key]
+
+    async def _upsert_many_raw(self, records, *, ctx):
+        self.events.append("restore")
+        if self.fail_restore:
+            raise OSError("vector restoration failed")
+        for record in records:
+            assert record["account_id"] == ctx.account_id
+            self.records[record["id"]] = dict(record)
+        return [record["id"] for record in records]
+
+
+@pytest.mark.asyncio
+async def test_rm_restores_approved_file_vectors_if_physical_delete_fails(monkeypatch):
+    """A failed delete leaves the original file and all its indexed metadata searchable."""
+    uri = "viking://resources/approved.md"
+    ctx = _default_ctx()
+    events = []
+    agfs = _RmAGFS(fail=True, events=events)
+    vectors = _RmVectors(uri, ctx, events)
+    fs = VikingFS(agfs=_FakeAGFS(), vector_store=vectors)
+    fs._async_agfs = agfs  # type: ignore[assignment]
+    monkeypatch.setattr(fs, "_ensure_access", AsyncMock())
+
+    with pytest.raises(OSError, match="physical deletion failed"):
+        await fs.rm(uri, ctx=ctx)
+
+    assert agfs.exists
+    assert list(vectors.records.values()) == [{
+        "id": "record-1", "uri": uri, "account_id": ctx.account_id,
+        "abstract": "approved result", "acl_read_users": ["reader"],
+    }]
+    assert events == ["acquire", "snapshot", "vector-delete", "physical-delete", "restore", "release"]
+
+
+@pytest.mark.asyncio
+async def test_rm_success_deletes_file_and_vectors_without_restoration(monkeypatch):
+    uri = "viking://resources/approved.md"
+    ctx = _default_ctx()
+    events = []
+    agfs = _RmAGFS(events=events)
+    vectors = _RmVectors(uri, ctx, events)
+    fs = VikingFS(agfs=_FakeAGFS(), vector_store=vectors)
+    fs._async_agfs = agfs  # type: ignore[assignment]
+    monkeypatch.setattr(fs, "_ensure_access", AsyncMock())
+
+    result = await fs.rm(uri, ctx=ctx)
+
+    assert result["deleted"] is True
+    assert not agfs.exists
+    assert vectors.records == {}
+    assert events == ["acquire", "snapshot", "vector-delete", "physical-delete", "release"]
+
+
+@pytest.mark.asyncio
+async def test_rm_does_not_create_ghost_vectors_if_backend_deleted_then_failed(monkeypatch):
+    uri = "viking://resources/approved.md"
+    ctx = _default_ctx()
+    events = []
+    agfs = _RmAGFS(fail_after_delete=True, events=events)
+    vectors = _RmVectors(uri, ctx, events)
+    fs = VikingFS(agfs=_FakeAGFS(), vector_store=vectors)
+    fs._async_agfs = agfs  # type: ignore[assignment]
+    monkeypatch.setattr(fs, "_ensure_access", AsyncMock())
+
+    with pytest.raises(OSError, match="backend failed after removing bytes"):
+        await fs.rm(uri, ctx=ctx)
+
+    assert not agfs.exists
+    assert vectors.records == {}
+    assert events == ["acquire", "snapshot", "vector-delete", "physical-delete", "release"]
+
+
+@pytest.mark.asyncio
+async def test_rm_surfaces_both_physical_and_vector_restoration_failures(monkeypatch):
+    uri = "viking://resources/approved.md"
+    ctx = _default_ctx()
+    events = []
+    agfs = _RmAGFS(fail=True, events=events)
+    vectors = _RmVectors(uri, ctx, events, fail_restore=True)
+    fs = VikingFS(agfs=_FakeAGFS(), vector_store=vectors)
+    fs._async_agfs = agfs  # type: ignore[assignment]
+    monkeypatch.setattr(fs, "_ensure_access", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="File deletion and vector restoration both failed") as caught:
+        await fs.rm(uri, ctx=ctx)
+
+    assert agfs.exists and not vectors.records
+    assert "physical deletion failed" in str(caught.value)
+    assert "vector restoration failed" in str(caught.value)
+    assert isinstance(caught.value.__cause__, OSError)
+    assert str(caught.value.__cause__) == "physical deletion failed"
+    assert events == ["acquire", "snapshot", "vector-delete", "physical-delete", "restore", "release"]

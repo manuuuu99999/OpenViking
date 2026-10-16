@@ -71,6 +71,7 @@ class _VFS:
         self.fail_rm_uri = None
         self.denied = set()
         self.access_checks = []
+        self.orphan_index = set()
         self._async_agfs = _Locks()
 
     async def _ensure_access(self, uri, ctx, *, action):
@@ -111,7 +112,8 @@ class _VFS:
         assert recursive is False
         if uri == self.fail_rm_uri:
             raise OSError("injected delete failure")
-        self.files.pop(uri)
+        self.files.pop(uri, None)
+        self.orphan_index.discard(uri)
         self.effects.append(("rm", uri))
         return {"estimated_deleted_count": 1}
 
@@ -271,6 +273,23 @@ async def test_a_failed_retirement_keeps_the_memory_readable_and_the_retry_compl
 
 
 @pytest.mark.asyncio
+async def test_completed_delete_is_reported_to_service_even_when_refresh_fails(ctx, monkeypatch):
+    vfs, coordinator = make({CURRENT: BASE})
+    confirmed = []
+
+    async def fail_refresh(self, **kwargs):
+        raise RuntimeError("refresh after removal failed")
+
+    monkeypatch.setattr(ContentWriteCoordinator, "_refresh_batch", fail_refresh)
+    with pytest.raises(Exception, match="refresh failed"):
+        await run(coordinator, ctx, retire_ops(), deleted_uris=confirmed)
+
+    assert confirmed == [CURRENT]
+    assert CURRENT not in vfs.files
+    assert HISTORY in vfs.files
+
+
+@pytest.mark.asyncio
 async def test_the_retry_after_a_completed_replacement_is_refused_as_a_stale_base(ctx):
     vfs, coordinator = make({CURRENT: BASE})
     await run(coordinator, ctx, replace_ops())
@@ -280,6 +299,27 @@ async def test_the_retry_after_a_completed_replacement_is_refused_as_a_stale_bas
         await run(coordinator, ctx, replace_ops())
 
     assert vfs.files == before
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retirement_removes_only_orphan_index_for_an_absent_file(ctx):
+    vfs, coordinator = make({HISTORY: f"history of: {BASE}"})
+    vfs.orphan_index.add(CURRENT)
+    confirmed = []
+    operation = {"uri": CURRENT, "mode": "reconcile_delete", "expected_sha256": sha(BASE)}
+
+    result = await run(coordinator, ctx, [operation], deleted_uris=confirmed)
+
+    assert result["deleted"] == [CURRENT]
+    assert confirmed == [CURRENT]
+    assert CURRENT not in vfs.orphan_index
+    assert HISTORY in vfs.files
+    assert CURRENT not in vfs.files
+
+    vfs.files[CURRENT] = NEW
+    with pytest.raises(ConflictError):
+        await run(coordinator, ctx, [operation])
+    assert vfs.files[CURRENT] == NEW
 
 
 @pytest.mark.asyncio

@@ -100,6 +100,11 @@ def test_batch_write_delete_needs_the_reviewed_hash_and_no_content():
     with pytest.raises(ValueError, match="exactly one"):
         BatchWriteOperation(uri=uri, mode="replace")
 
+    reconcile = BatchWriteOperation(uri=uri, mode="reconcile_delete", expected_sha256=digest)
+    assert reconcile.model_dump(exclude_none=True)["mode"] == "reconcile_delete"
+    with pytest.raises(ValueError, match="no content"):
+        BatchWriteOperation(uri=uri, mode="reconcile_delete", content="x", expected_sha256=digest)
+
 
 async def test_batch_write_forwards_processing_mode_and_operation_metadata(monkeypatch):
     seen = {}

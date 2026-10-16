@@ -59,10 +59,10 @@ class BatchWriteOperation(BaseModel):
     uri: str
     content: str | None = None
     content_base64: str | None = None
-    # ``delete`` removes one resource file, only if its bytes still hash to expected_sha256.
-    mode: Literal["replace", "append", "create", "upsert", "delete"] = "replace"
+    # ``delete`` checks current bytes; ``reconcile_delete`` cleans an already absent file.
+    mode: Literal["replace", "append", "create", "upsert", "delete", "reconcile_delete"] = "replace"
     # Optional byte revision, checked under the existing file locks before any writes.
-    # Required for ``delete``.
+    # Required for both delete modes.
     expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     tags: list[str] | None = None
     tag_mode: Literal["replace", "append", "clear"] = "replace"
@@ -70,7 +70,7 @@ class BatchWriteOperation(BaseModel):
 
     @model_validator(mode="after")
     def validate_content_shape(self) -> "BatchWriteOperation":
-        if self.mode == "delete":
+        if self.mode in {"delete", "reconcile_delete"}:
             if self.content is not None or self.content_base64 is not None:
                 raise ValueError("delete takes no content or content_base64")
             if self.expected_sha256 is None:

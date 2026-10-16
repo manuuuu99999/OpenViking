@@ -244,8 +244,22 @@ export async function applyChange({ publisherClient, historyUser, intent, signal
       expected_sha256: intent.baseHash,
       acl: intent.currentAcl,
     });
+  return sendConditionalBatch(publisherClient, rootUri, operations, signal);
+}
+
+/** An absent retired file needs one safe server pass to finish index and reference cleanup. */
+export async function reconcileRetirement({ publisherClient, targetUri, baseHash, signal }) {
+  const rootUri = targetUri.slice(0, targetUri.indexOf("/approved/memories/"));
+  return sendConditionalBatch(publisherClient, rootUri, [{
+    uri: targetUri,
+    mode: "reconcile_delete",
+    expected_sha256: baseHash,
+  }], signal);
+}
+
+async function sendConditionalBatch(client, rootUri, operations, signal) {
   try {
-    const response = await publisherClient.fetchJSON("/api/v1/content/batch-write", {
+    const response = await client.fetchJSON("/api/v1/content/batch-write", {
       method: "POST",
       body: JSON.stringify({ root_uri: rootUri, operations, wait: true }),
     }, { signal });

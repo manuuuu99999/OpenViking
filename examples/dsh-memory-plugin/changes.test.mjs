@@ -450,6 +450,50 @@ test("an interrupted retirement keeps the memory current until the retry complet
   assert.equal((await world.decide(proposal.id, "approve")).status, "already_published");
 }));
 
+test("a retirement with a lost response only completes after safe server cleanup", () => withWorld(async world => {
+  const base = world.addConversation(BASE_FACT, { name: "shipping" });
+  const { uri } = await world.approveAlta(base);
+  const later = world.addConversation("Invented rule: MAN354_BASE_a1 no longer applies.", { name: "retired" });
+  const proposal = await world.prepare(later, { changeKind: "retire", targetUri: uri });
+  world.server.clearCalls();
+  world.server.failNext({ method: "BATCH", uriIncludes: "/approved/", stage: "afterAll" });
+  world.server.failNext({ method: "BATCH", uriIncludes: "/approved/", stage: "refuse", status: 503, code: "UNAVAILABLE" });
+
+  const failed = await world.decide(proposal.id, "approve", "Retired after review.");
+  assert.equal(failed.status, "publication_failed");
+  assert.equal(failed.stage, "cleanup");
+  assert.equal(failed.decisionId, proposal.id);
+  assert.equal(world.approvedText(uri), undefined);
+  assert.equal((await world.call("openviking_review_proposal", { proposalId: proposal.id })).status, "publishing");
+
+  const completed = await world.decide(proposal.id, "approve");
+  assert.equal(completed.status, "already_published");
+  const batches = world.server.callsBy("publisher-admin", "POST")
+    .filter(call => call.path === "/api/v1/content/batch-write");
+  assert.equal(batches.length, 3);
+  assert.deepEqual(JSON.parse(batches.at(-1).body).operations.map(op => op.mode), ["reconcile_delete"]);
+  assert.equal(world.approvedText(uri), undefined);
+}));
+
+test("reconciliation refuses a newer file created after retirement inspection", () => withWorld(async world => {
+  const base = world.addConversation(BASE_FACT, { name: "shipping" });
+  const { uri } = await world.approveAlta(base);
+  const later = world.addConversation("Invented rule: MAN354_BASE_a1 no longer applies.", { name: "retired" });
+  const proposal = await world.prepare(later, { changeKind: "retire", targetUri: uri });
+  const newer = "# Another complete approved version";
+  world.server.failNext({ method: "BATCH", uriIncludes: "/approved/", stage: "afterAll" });
+  world.server.failNext({
+    method: "BATCH", uriIncludes: "/approved/", stage: "none",
+    mutate: () => world.server.resources.set(uri, { content: newer, acl: undefined }),
+  });
+  const result = await world.decide(proposal.id, "approve", "Retire the reviewed version.");
+  assert.equal(result.status, "publication_failed");
+  assert.equal(result.stage, "cleanup");
+  assert.equal(world.approvedText(uri), newer);
+  assert.equal((await world.decide(proposal.id, "approve")).status, "base_version_changed");
+  assert.equal(world.approvedText(uri), newer);
+}));
+
 test("human confirmation shows full original, before and after for a long change", () => withWorld(async world => {
   const oldFact = `Invented rule: ${"old-".repeat(170)} ends today.`;
   const newFact = `Invented rule: ${"new-".repeat(170)} starts tomorrow.`;
@@ -539,6 +583,19 @@ for (const kind of ["replace", "retire"]) {
   }));
 }
 
+test("a failed batch reports the server status and code without guessing its cause", () => withWorld(async world => {
+  const base = world.addConversation(BASE_FACT, { name: "shipping" });
+  const { uri } = await world.approveAlta(base);
+  const later = world.addConversation(NEW_FACT, { name: "later" });
+  const proposal = await world.prepare(later, { changeKind: "replace", targetUri: uri });
+  world.server.failNext({ method: "BATCH", uriIncludes: "/approved/", stage: "refuse", status: 403, code: "PERMISSION_DENIED" });
+  const denied = await world.decide(proposal.id, "approve", "Keep the verified change.");
+  assert.equal(denied.status, "publication_failed");
+  assert.deepEqual(denied.failure, { source: "publication", status: 403, code: "PERMISSION_DENIED" });
+  assert.equal(denied.recoverable, false);
+  assert.equal(world.approvedText(uri).includes(NEW_FACT), false);
+}));
+
 test("a server without conditional batch support fails closed and never falls back to plain writes", () => withWorld(async world => {
   const base = world.addConversation(BASE_FACT, { name: "shipping" });
   const { uri } = await world.approveAlta(base);
@@ -550,7 +607,8 @@ test("a server without conditional batch support fails closed and never falls ba
   const result = await world.decide(proposal.id, "approve", "Try on an old server.");
   assert.equal(result.status, "publication_failed");
   assert.equal(result.stage, "publish");
-  assert.equal(result.reason, "server_unsupported");
+  assert.equal(result.reason, "server_rejected_request");
+  assert.deepEqual(result.failure, { source: "publication", status: 422, code: "INVALID_ARGUMENT" });
   assert.equal(result.recoverable, false);
   assert.equal(world.approvedText(uri), baseContent);
   const publisherCalls = world.server.callsBy("publisher-admin");

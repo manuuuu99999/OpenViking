@@ -470,7 +470,20 @@ curl -X POST http://localhost:1933/api/v1/content/batch-write \
 }
 ```
 
-CLI 当前不直接提供批量写入命令。
+批量操作也支持有条件地替换或删除资源文件。将 `expected_sha256` 设为当前文件字节的 SHA-256 小写十六进制摘要；`mode: "delete"` 必须提供该字段，且不能携带内容、标签或 ACL 更新。例如，可以在同一批次中先复制旧版本到历史记录，再撤下当前版本：
+
+```json
+{
+  "root_uri": "viking://resources/wiki",
+  "operations": [
+    {"uri": "viking://resources/wiki/history/page-v1.md", "content": "# Previous version\n", "mode": "create"},
+    {"uri": "viking://resources/wiki/approved/page.md", "mode": "delete", "expected_sha256": "<64 lowercase hex characters>"}
+  ],
+  "wait": true
+}
+```
+
+发送前须将占位摘要替换为实际哈希值。目标不存在或内容改变时，服务器会在写入前返回冲突。成功删除的 URI 位于 `result.deleted`；没有删除时该字段省略。如果撤下操作在文件消失后中断，可另发仅含一个 `mode: "reconcile_delete"` 操作的批次，提供原 URI 和原 `expected_sha256`，清理遗留索引、监视任务和记忆引用。仅当文件仍不存在时才会执行；若该 URI 已有新文件，则返回冲突且不会触碰新文件。调用方必须先确认自己的历史副本，再执行修复。**批量操作不保证事务性回滚**：文件系统或后续刷新在开始修改后失败时，需检查文件并重试或修复部分结果，不能假定操作全部撤销。CLI 当前不直接提供批量写入命令。
 
 ---
 

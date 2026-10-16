@@ -470,7 +470,20 @@ curl -X POST http://localhost:1933/api/v1/content/batch-write \
 }
 ```
 
-The CLI does not currently expose batch write directly.
+Batch operations can also conditionally replace or delete a resource file. Set `expected_sha256` to the lowercase SHA-256 digest of its current bytes; `mode: "delete"` requires it and must not include content, tags, or ACL changes. For example, an approved version can be copied to history first and then retired in the same batch:
+
+```json
+{
+  "root_uri": "viking://resources/wiki",
+  "operations": [
+    {"uri": "viking://resources/wiki/history/page-v1.md", "content": "# Previous version\n", "mode": "create"},
+    {"uri": "viking://resources/wiki/approved/page.md", "mode": "delete", "expected_sha256": "<64 lowercase hex characters>"}
+  ],
+  "wait": true
+}
+```
+
+Replace the digest placeholder with the actual hash before sending. A missing or changed target returns a conflict before any writes. A successful deletion appears under `result.deleted`; omitted when nothing was deleted. If a retirement was interrupted after its file disappeared, a **separate** batch with one `mode: "reconcile_delete"` operation, the deleted URI and its original `expected_sha256` cleans up any orphan index record, watch task and memory reference. It succeeds only while the file remains absent; if a new file exists at that URI it returns a conflict and leaves that file untouched. Callers must first verify their own history copy before reconciling. The batch is **not a transactional rollback** for filesystem or downstream refresh errors after mutation starts: inspect the files and retry or reconcile partial outcomes rather than assuming every operation was undone. The CLI does not currently expose batch write directly.
 
 ---
 

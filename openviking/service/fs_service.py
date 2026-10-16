@@ -1255,24 +1255,50 @@ class FSService:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()
         coordinator = ContentWriteCoordinator(viking_fs=viking_fs, vikingdb=self._vikingdb)
-        result = await coordinator.batch_write(
-            root_uri=root_uri,
-            operations=operations,
-            ctx=ctx,
-            wait=wait,
-            timeout=timeout,
-            skip_conflicts=skip_conflicts,
-            processing_mode=processing_mode,
-        )
-        # Same follow-ups as ``rm`` for every file the batch removed.
-        for deleted_uri in result.get("deleted", []):
-            await self._sync_watch_after_rm(
-                deleted_uri, account_id=ctx.account_id, context_type="resource"
+        deleted: list[str] = []
+
+        async def clean_confirmed_deletions() -> None:
+            # The coordinator reports each physical removal before refreshing semantics;
+            # a later refresh failure must not skip watch or reference cleanup.
+            errors: list[str] = []
+            for deleted_uri in deleted:
+                try:
+                    await self._sync_watch_after_rm(
+                        deleted_uri, account_id=ctx.account_id, context_type="resource"
+                    )
+                except Exception as exc:
+                    errors.append(f"watch {deleted_uri}: {exc}")
+                if self._resource_memory_link_service:
+                    try:
+                        cleanup = await self._resource_memory_link_service.before_resource_delete(
+                            ctx=ctx, resource_uri=deleted_uri, recursive=False
+                        )
+                        commit_status = cleanup.get("memory_commit", {}).get("status")
+                        if cleanup.get("status") == "failed" or commit_status == "failed":
+                            errors.append(f"memory links {deleted_uri}: {cleanup}")
+                    except Exception as exc:
+                        errors.append(f"memory links {deleted_uri}: {exc}")
+            if errors:
+                raise RuntimeError("Batch delete cleanup failed: " + "; ".join(errors))
+
+        try:
+            result = await coordinator.batch_write(
+                root_uri=root_uri,
+                operations=operations,
+                ctx=ctx,
+                wait=wait,
+                timeout=timeout,
+                skip_conflicts=skip_conflicts,
+                processing_mode=processing_mode,
+                deleted_uris=deleted,
             )
-            if self._resource_memory_link_service:
-                await self._resource_memory_link_service.before_resource_delete(
-                    ctx=ctx, resource_uri=deleted_uri, recursive=False
-                )
+        except BaseException:
+            try:
+                await clean_confirmed_deletions()
+            except Exception:
+                logger.exception("Batch deletion cleanup failed after an earlier batch error")
+            raise
+        await clean_confirmed_deletions()
         return result
 
     async def set_tags(
