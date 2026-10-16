@@ -388,10 +388,12 @@ test("an interrupted publication never shows mixed versions, keeps the previous 
   const later = world.addConversation(NEW_FACT, { name: "shipping-new" });
   const proposal = await world.prepare(later, { changeKind: "replace", targetUri: uri });
 
-  world.server.failNext({ method: "POST", uriIncludes: "/approved/", status: 500 });
+  world.server.failNext({ method: "BATCH", uriIncludes: "/approved/", stage: "afterHistory" });
   const failed = await world.decide(proposal.id, "approve", "Fridays replaced Mondays.");
   assert.equal(failed.status, "publication_failed");
   assert.equal(failed.recoverable, true);
+  assert.equal(failed.stage, "publish");
+  assert.equal(historyEntries(world).length, 1, "history is ahead of current, never behind");
   assert.equal(failed.decisionId, proposal.id);
   assert.equal(world.approvedText(uri), baseContent, "normal reading still has the whole previous version");
   const publishing = await world.call("openviking_review_proposal", { proposalId: proposal.id });
@@ -407,17 +409,17 @@ test("an interrupted publication never shows mixed versions, keeps the previous 
   assert.equal(historyEntries(world).length, 1);
 }));
 
-test("a lost response after the write is recovered without a second write", () => withWorld(async world => {
+test("a lost response after the batch committed is recognised as published without a second write", () => withWorld(async world => {
   const base = world.addConversation(BASE_FACT, { name: "shipping" });
   const { uri } = await world.approveAlta(base);
   const later = world.addConversation(EXTRA_FACT, { name: "shipping-extra" });
   const proposal = await world.prepare(later, { changeKind: "extend", targetUri: uri });
 
-  world.server.failNext({ method: "POST", uriIncludes: "/approved/", applyBeforeFailing: true });
+  world.server.failNext({ method: "BATCH", uriIncludes: "/approved/", stage: "afterAll" });
   const lost = await world.decide(proposal.id, "approve", "Same rule, one more condition.");
-  assert.equal(lost.status, "publication_failed");
+  assert.equal(lost.status, "already_published", "the server state shows the change is complete");
   const applied = world.approvedText(uri);
-  assert.ok(applied.includes(EXTRA_FACT), "the server did apply the write");
+  assert.ok(applied.includes(EXTRA_FACT), "the server did apply the batch");
   const writes = world.server.callsBy("publisher-admin", "POST").length;
 
   const recovered = await world.decide(proposal.id, "approve");
@@ -436,10 +438,11 @@ test("an interrupted retirement keeps the memory current until the retry complet
   const later = world.addConversation("Invented rule: MAN354_BASE_a1 no longer applies.", { name: "shipping-retired" });
   const proposal = await world.prepare(later, { changeKind: "retire", targetUri: uri });
 
-  world.server.failNext({ method: "DELETE", uriIncludes: "/approved/", status: 500 });
+  world.server.failNext({ method: "BATCH", uriIncludes: "/approved/", stage: "afterHistory" });
   const failed = await world.decide(proposal.id, "approve", "Dropped on purpose.");
   assert.equal(failed.status, "publication_failed");
   assert.equal(world.approvedText(uri), baseContent);
+  assert.equal(historyEntries(world).length, 1, "the whole previous version is already in history");
   const retried = await world.decide(proposal.id, "approve");
   assert.equal(retried.status, "published", JSON.stringify(retried));
   assert.equal(world.approvedText(uri), undefined);
@@ -509,6 +512,47 @@ test("changes need the history route and never read approved content through the
   const proposal = await world.prepare(later, { changeKind: "extend", targetUri: uri });
   await world.decide(proposal.id, "approve", "Fine.");
   assert.equal(world.server.callsBy("publisher-admin", "GET").filter(call => call.path.startsWith("/api/v1/content/read")).length, 0);
-  const historyWrite = world.server.callsBy("publisher-admin", "POST").find(call => JSON.parse(call.body).uri.includes("/history/"));
-  assert.deepEqual(JSON.parse(historyWrite.body).acl.entries, [{ principal: "user:history", level: "read" }]);
+  const batch = world.server.callsBy("publisher-admin", "POST").find(call => call.path === "/api/v1/content/batch-write");
+  const historyOperation = JSON.parse(batch.body).operations.find(operation => operation.uri.includes("/history/"));
+  assert.deepEqual(historyOperation.acl.entries, [{ principal: "user:history", level: "read" }]);
+}));
+
+for (const kind of ["replace", "retire"]) {
+  test(`a ${kind} whose base moved after the preflight is refused by the server and loses nothing`, () => withWorld(async world => {
+    const base = world.addConversation(BASE_FACT, { name: "shipping" });
+    const { uri } = await world.approveAlta(base);
+    const later = world.addConversation(kind === "retire" ? "Invented rule: MAN354_BASE_a1 no longer applies." : NEW_FACT, { name: "later" });
+    const proposal = await world.prepare(later, { changeKind: kind, targetUri: uri });
+    const moved = "# Somebody else's complete version two";
+    world.server.failNext({
+      method: "BATCH",
+      uriIncludes: "/approved/",
+      stage: "none",
+      mutate: () => world.server.resources.set(uri, { content: moved, acl: undefined }),
+    });
+    const result = await world.decide(proposal.id, "approve", "Reviewed against the old base.");
+    assert.equal(result.status, "base_version_changed");
+    assert.equal(world.server.resources.get(uri)?.content, moved, "the newer version is neither overwritten nor deleted");
+    assert.equal(historyEntries(world).length, 0, "nothing was copied to history");
+    const stored = await world.call("openviking_review_proposal", { proposalId: proposal.id });
+    assert.equal(stored.status, "needs_new_review");
+  }));
+}
+
+test("a server without conditional batch support fails closed and never falls back to plain writes", () => withWorld(async world => {
+  const base = world.addConversation(BASE_FACT, { name: "shipping" });
+  const { uri } = await world.approveAlta(base);
+  const baseContent = world.approvedText(uri);
+  const later = world.addConversation(NEW_FACT, { name: "later" });
+  const proposal = await world.prepare(later, { changeKind: "replace", targetUri: uri });
+  world.server.state.batchSupported = false;
+  world.server.clearCalls();
+  const result = await world.decide(proposal.id, "approve", "Try on an old server.");
+  assert.equal(result.status, "publication_failed");
+  assert.equal(result.stage, "publish");
+  assert.equal(result.reason, "server_unsupported");
+  assert.equal(result.recoverable, false);
+  assert.equal(world.approvedText(uri), baseContent);
+  const publisherCalls = world.server.callsBy("publisher-admin");
+  assert.deepEqual(publisherCalls.map(call => call.path).filter(path => path.startsWith("/api/v1/content") || path.startsWith("/api/v1/fs")), ["/api/v1/content/batch-write"]);
 }));

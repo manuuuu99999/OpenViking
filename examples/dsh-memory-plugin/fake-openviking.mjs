@@ -1,6 +1,8 @@
 // In-memory stand-in for the OpenViking routes the proposal tools use. Test support only:
 // it models per-identity read access, ACL-restricted resources and injectable failures.
 
+import { createHash } from "node:crypto";
+
 const APPROVED_SEGMENT = "/approved/";
 const HISTORY_SEGMENT = "/history/";
 
@@ -9,7 +11,7 @@ export function createFakeOpenViking({ account = "project-a" } = {}) {
   const candidateFiles = new Map();
   const calls = [];
   const failures = [];
-  const state = { aclEnabled: true };
+  const state = { aclEnabled: true, batchSupported: true };
 
   const respond = (ok, status, extra = {}) => (ok
     ? { ok: true, status, result: extra.result ?? {} }
@@ -51,6 +53,38 @@ export function createFakeOpenViking({ account = "project-a" } = {}) {
           resources.set(body.uri, { content: body.content, acl: body.acl });
           if (failure) return respond(false, 0, { code: "NETWORK_ERROR" });
           return respond(true, 200, { result: { uri: body.uri } });
+        }
+        if (method === "POST" && request.pathname === "/api/v1/content/batch-write") {
+          // Mirrors the server: validate every operation against the current bytes first
+          // (a stale or missing base refuses the whole batch with a conflict and writes
+          // nothing), then apply unconditioned writes before conditioned ones and deletes.
+          const body = JSON.parse(init.body);
+          if (!state.batchSupported) return respond(false, 422, { code: "INVALID_ARGUMENT" });
+          const operations = body.operations || [];
+          const failureIndex = failures.findIndex(item => item.method === "BATCH"
+            && (!item.uriIncludes || operations.some(op => op.uri.includes(item.uriIncludes))));
+          const failure = failureIndex < 0 ? null : failures.splice(failureIndex, 1)[0];
+          if (failure?.stage === "refuse") return respond(false, failure.status || 500, { code: "INTERNAL" });
+          failure?.mutate?.(); // another publisher gets in after this caller's preflight
+          for (const op of operations) {
+            if (op.expected_sha256 === undefined) continue;
+            const existing = resources.get(op.uri);
+            const digest = existing ? createHash("sha256").update(existing.content).digest("hex") : null;
+            if (digest !== op.expected_sha256) return respond(false, 409, { code: "CONFLICT" });
+          }
+          const ordered = [...operations].sort((a, b) => {
+            const rank = op => (op.mode === "delete" || op.expected_sha256 !== undefined ? 1 : 0);
+            return rank(a) - rank(b) || (a.uri < b.uri ? -1 : 1);
+          });
+          let applied = 0;
+          for (const op of ordered) {
+            if (failure?.stage === "afterHistory" && applied === 1) return respond(false, 500, { code: "INTERNAL" });
+            if (op.mode === "delete") resources.delete(op.uri);
+            else resources.set(op.uri, { content: op.content, acl: op.acl });
+            applied += 1;
+          }
+          if (failure?.stage === "afterAll") return respond(false, 0, { code: "NETWORK_ERROR" });
+          return respond(true, 200, { result: { root_uri: body.root_uri } });
         }
         if (method === "DELETE" && request.pathname === "/api/v1/fs") {
           const failure = matchFailure(user, "DELETE", uri);

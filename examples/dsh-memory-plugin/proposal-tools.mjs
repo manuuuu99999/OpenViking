@@ -310,10 +310,23 @@ async function decideChange(proposal, reason, resuming, exec, {
     publisherClient,
     historyUser: historyClient.config.user,
     intent,
-    historyExists: state.historyExists,
     signal: exec?.signal,
   });
-  if (!applied.ok) return answer("publication_failed", { recoverable: true, stage: applied.stage });
+  if (!applied.ok) {
+    // The server may have refused because the base moved, or the answer may have been lost
+    // after it committed. Look once; only a final state is settled here.
+    const after = await inspect();
+    if (["base_changed", "completed", "history_conflict"].includes(after.state)) {
+      const finished = await settle(after);
+      if (finished) return finished;
+    }
+    const unsupported = applied.status === 400 || applied.status === 422;
+    return answer("publication_failed", {
+      recoverable: !unsupported,
+      stage: applied.stage,
+      ...(unsupported ? { reason: "server_unsupported" } : {}),
+    });
+  }
   await store.save({
     ...proposal,
     status: "approved",

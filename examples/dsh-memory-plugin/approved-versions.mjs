@@ -6,8 +6,9 @@ import { createHash } from "node:crypto";
  * One approved memory is one file under `viking://resources/<project>/approved/memories/`.
  * A change never edits it in place without first copying the whole previous file to
  * `viking://resources/<project>/history/memories/`, readable only by the history identity.
- * The current file is then replaced (or deleted, for a retirement) in a single write, so a
- * normal read sees either the previous version or the next one, never a mixture.
+ * The current file is then replaced (or deleted, for a retirement) in the same server-side
+ * batch, only if it still has the reviewed bytes, so a normal read sees either the previous
+ * version or the next one, never a mixture, and a moved base is refused (O2).
  */
 
 export const APPROVAL_SCHEMA = "openviking.dsh.approval.v1";
@@ -218,50 +219,39 @@ export async function inspectChange({ approvedClient, historyClient, proposal, s
 }
 
 /**
- * Apply a stored intent: copy the whole previous version to history first, then replace or
- * delete the current memory. Either step may be repeated safely.
+ * Apply a stored intent as ONE conditional batch on the server: the whole previous version
+ * goes to history, then the current memory is replaced (or deleted, for a retirement) only if
+ * its bytes still hash to the version the human reviewed. The server checks that hash and
+ * performs every write while it holds the lock on both files, orders the history copy first,
+ * and refuses the whole batch with a conflict when the base moved. There is no fallback to
+ * separate unconditional writes: any answer other than success is a failed publication.
  */
-export async function applyChange({ publisherClient, historyUser, intent, historyExists, signal }) {
-  if (!historyExists) {
-    const written = await write(publisherClient, {
-      uri: intent.historyUri,
-      content: intent.historyContent,
-      mode: "create",
-      wait: true,
-      acl: { acl_mode: "restricted", entries: [{ principal: `user:${historyUser}`, level: "read" }] },
-    }, signal);
-    if (!written) return { ok: false, stage: "history" };
-  }
-  if (intent.kind === "retire") {
-    try {
-      const removed = await publisherClient.fetchJSON(
-        `/api/v1/fs?uri=${encodeURIComponent(intent.targetUri)}&wait=true`,
-        { method: "DELETE" },
-        { signal },
-      );
-      return removed.ok ? { ok: true } : { ok: false, stage: "current" };
-    } catch {
-      return { ok: false, stage: "current" };
-    }
-  }
-  const replaced = await write(publisherClient, {
-    uri: intent.targetUri,
-    content: intent.newContent,
-    mode: "replace",
-    wait: true,
-    acl: intent.currentAcl,
-  }, signal);
-  return replaced ? { ok: true } : { ok: false, stage: "current" };
-}
-
-async function write(client, body, signal) {
+export async function applyChange({ publisherClient, historyUser, intent, signal }) {
+  const marker = "/approved/memories/";
+  const rootUri = intent.targetUri.slice(0, intent.targetUri.indexOf(marker));
+  const operations = [{
+    uri: intent.historyUri,
+    content: intent.historyContent,
+    mode: "create",
+    acl: { acl_mode: "restricted", entries: [{ principal: `user:${historyUser}`, level: "read" }] },
+  }];
+  operations.push(intent.kind === "retire"
+    ? { uri: intent.targetUri, mode: "delete", expected_sha256: intent.baseHash }
+    : {
+      uri: intent.targetUri,
+      content: intent.newContent,
+      mode: "replace",
+      expected_sha256: intent.baseHash,
+      acl: intent.currentAcl,
+    });
   try {
-    const response = await client.fetchJSON("/api/v1/content/write", {
+    const response = await publisherClient.fetchJSON("/api/v1/content/batch-write", {
       method: "POST",
-      body: JSON.stringify(body),
+      body: JSON.stringify({ root_uri: rootUri, operations, wait: true }),
     }, { signal });
-    return Boolean(response.ok);
+    if (response.ok) return { ok: true };
+    return { ok: false, stage: "publish", status: response.status || 0, code: response.error?.code || "" };
   } catch {
-    return false;
+    return { ok: false, stage: "publish", status: 0, code: "NETWORK_ERROR" };
   }
 }
