@@ -1003,6 +1003,7 @@ async def test_batch_refresh_groups_resource_and_memory_work(monkeypatch):
         refresh_kinds={
             "viking://resources/wiki/a.md": "added",
             "viking://resources/wiki/b.md": "modified",
+            "viking://resources/wiki/retired.md": "deleted",
             "viking://user/default/memories/preferences/wiki/a.md": "added",
             "viking://user/default/memories/preferences/wiki/b.md": "modified",
         },
@@ -1015,6 +1016,7 @@ async def test_batch_refresh_groups_resource_and_memory_work(monkeypatch):
     assert semantic_calls[0]["changes"] == {
         "added": ["viking://resources/wiki/a.md"],
         "modified": ["viking://resources/wiki/b.md"],
+        "deleted": ["viking://resources/wiki/retired.md"],
     }
     assert len(overview_calls) == 1
     assert overview_calls[0]["strict"] is True
