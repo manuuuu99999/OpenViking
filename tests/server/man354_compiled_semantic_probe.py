@@ -103,21 +103,87 @@ async def main():
                 assert current in before, ("positive search control failed", sorted(before))
                 read = await client.get("/api/v1/content/read", params={"uri": current})
                 assert read.status_code == 200 and read.json()["result"] == content, read.text[:500]
-                retire = await client.post("/api/v1/content/batch-write", json={
-                    "root_uri": root, "wait": True,
-                    "operations": [
-                        {"uri": history, "content": content, "mode": "create"},
-                        {"uri": current, "mode": "delete",
-                         "expected_sha256": hashlib.sha256(content.encode()).hexdigest()},
-                    ]})
+                def digest(text):
+                    return hashlib.sha256(text.encode()).hexdigest()
+
+                async def batch(operations):
+                    return await client.post("/api/v1/content/batch-write", json={
+                        "root_uri": root, "wait": True, "operations": operations})
+
+                async def read_text(uri):
+                    response = await client.get("/api/v1/content/read", params={"uri": uri})
+                    return response.status_code, (response.json().get("result")
+                                                  if response.status_code == 200 else None)
+
+                # Another writer approves a replacement (v1 -> v2) while a second
+                # one still holds the v1 revision it read earlier.
+                v2 = "# Synthetic rule\nFaro synthetic owner Marta (second approved version)"
+                replace = await batch([
+                    {"uri": history, "content": content, "mode": "create"},
+                    {"uri": current, "content": v2, "mode": "replace",
+                     "expected_sha256": digest(content)},
+                ])
+                assert replace.status_code == 200, (replace.status_code, replace.text[:500])
+                assert await read_text(current) == (200, v2)
+
+                # S-stale-retire: a retirement prepared against v1 must not delete v2.
+                stale_history = root + "/history/rule.stale-retire.md"
+                stale_retire = await batch([
+                    {"uri": stale_history, "content": content, "mode": "create"},
+                    {"uri": current, "mode": "delete", "expected_sha256": digest(content)},
+                ])
+                assert stale_retire.status_code == 409, (stale_retire.status_code, stale_retire.text[:500])
+                assert await read_text(current) == (200, v2), "stale retirement changed the current version"
+                assert (await read_text(stale_history))[0] == 404, "stale retirement wrote a history copy"
+                assert current in await search(), "stale retirement removed the current version from search"
+
+                # S-stale-replace: a replacement prepared against v1 must not overwrite v2.
+                stale_replace = await batch([
+                    {"uri": root + "/history/rule.stale-replace.md", "content": content, "mode": "create"},
+                    {"uri": current, "content": "# stale overwrite", "mode": "replace",
+                     "expected_sha256": digest(content)},
+                ])
+                assert stale_replace.status_code == 409, (stale_replace.status_code, stale_replace.text[:500])
+                assert await read_text(current) == (200, v2), "stale replacement overwrote the current version"
+                assert (await read_text(root + "/history/rule.stale-replace.md"))[0] == 404
+
+                # S-race: two writers read v2 and submit at the same instant.
+                # Exactly one may win; the loser must leave no trace.
+                variants = {
+                    "a": "# Synthetic rule\nFaro synthetic owner Marta (writer A)",
+                    "b": "# Synthetic rule\nFaro synthetic owner Marta (writer B)",
+                }
+                histories = {k: root + f"/history/rule.race-{k}.md" for k in variants}
+                racers = await asyncio.gather(*[
+                    batch([
+                        {"uri": histories[k], "content": v2, "mode": "create"},
+                        {"uri": current, "content": variants[k], "mode": "replace",
+                         "expected_sha256": digest(v2)},
+                    ]) for k in variants
+                ])
+                statuses = sorted(r.status_code for r in racers)
+                assert statuses == [200, 409], ("race outcomes", statuses, [r.text[:300] for r in racers])
+                winner = next(k for k, r in zip(variants, racers) if r.status_code == 200)
+                loser = next(k for k in variants if k != winner)
+                assert await read_text(current) == (200, variants[winner]), "current is not the winner's content"
+                assert await read_text(histories[winner]) == (200, v2), "winner's history copy is missing"
+                assert (await read_text(histories[loser]))[0] == 404, "loser left a history copy"
+
+                # Fresh retirement with the revision actually current.
+                final_text = variants[winner]
+                retire = await batch([
+                    {"uri": root + "/history/rule.final.md", "content": final_text, "mode": "create"},
+                    {"uri": current, "mode": "delete", "expected_sha256": digest(final_text)},
+                ])
                 assert retire.status_code == 200, (retire.status_code, retire.text[:500])
                 assert retire.json()["result"]["deleted"] == [current], retire.text[:500]
                 assert current not in await search(), "retired URI still in semantic search"
-                prior = await client.get("/api/v1/content/read", params={"uri": history})
-                assert prior.status_code == 200 and prior.json()["result"] == content, prior.text[:500]
-                missing = await client.get("/api/v1/content/read", params={"uri": current})
-                assert missing.status_code == 404, (missing.status_code, missing.text[:500])
-                print("PASS: visible before, absent after retirement, history intact")
+                assert await read_text(history) == (200, content), "v1 history lost"
+                assert await read_text(histories[winner]) == (200, v2), "v2 history lost"
+                assert await read_text(root + "/history/rule.final.md") == (200, final_text)
+                assert (await read_text(current))[0] == 404
+                print("PASS: stale retire/replace rejected without writes, race had one winner, "
+                      "visible before, absent after retirement, history intact")
         finally:
             await service.close()
             OpenVikingConfigSingleton.reset_instance()
