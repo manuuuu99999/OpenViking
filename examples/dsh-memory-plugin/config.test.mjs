@@ -156,3 +156,15 @@ test("isolated candidate route replaces the legacy connection without sharing it
   assert.equal(config.memoryIsolation.approved.apiKey, "approved-key");
   assert.equal(config.memoryIsolation.history.apiKey, "history-key");
 });
+
+test("publisher and approved routes must share the publication endpoint", () => {
+  assert.throws(() => resolveConfig({
+    memoryIsolation: {
+      candidate: { endpoint: "http://127.0.0.1:49327", apiKey: "candidate-key", account: "project-a", user: "candidate" },
+      approved: { endpoint: "http://127.0.0.1:49327", apiKey: "approved-key", account: "project-a", user: "approved" },
+      history: { endpoint: "http://127.0.0.1:49327", apiKey: "history-key", account: "project-a", user: "history" },
+      publisher: { endpoint: "http://127.0.0.1:49328", apiKey: "publisher-key", account: "project-a", user: "publisher-admin" },
+      approvalAuthorLabel: "Synthetic reviewer (configured)",
+    },
+  }, {}), /publisher route must use the approved endpoint/);
+});

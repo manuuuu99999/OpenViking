@@ -331,3 +331,38 @@ test("apply mounts the tool surface instead of registering tools itself", () => 
   assert.ok(bridge, "the MCP bridge must be mounted");
   assert.equal(bridge.config.env.OPENVIKING_URL, "http://127.0.0.1:1933");
 });
+
+test("a distinct publication credential never reaches ordinary MCP bridges", () => {
+  const config = resolveConfig({
+    workspacePeer: false,
+    memoryIsolation: {
+      candidate: { endpoint: "http://127.0.0.1:49327", apiKey: "candidate-key", account: "project-a", user: "candidate" },
+      approved: { endpoint: "http://127.0.0.1:49327", apiKey: "approved-key", account: "project-a", user: "approved" },
+      history: { endpoint: "http://127.0.0.1:49327", apiKey: "history-key", account: "project-a", user: "history" },
+      publisher: { endpoint: "http://127.0.0.1:49327", apiKey: "publisher-key", account: "project-a", user: "publisher-admin" },
+      approvalAuthorLabel: "Synthetic reviewer (configured)",
+    },
+  }, {});
+
+  assert.equal(config.memoryIsolation.publisher.apiKey, "publisher-key");
+  assert.equal(config.memoryIsolation.approvalAuthorLabel, "Synthetic reviewer (configured)");
+  for (const role of ["approved", "history"]) {
+    const bridge = buildMcpConfig(config, { role });
+    assert.equal(bridge.env.OPENVIKING_API_KEY, `${role}-key`);
+    assert.equal(JSON.stringify(bridge).includes("publisher-key"), false);
+    assert.equal(JSON.stringify(bridge).includes("Synthetic reviewer"), false);
+    assert.equal(bridge.env.OPENVIKING_MCP_ALLOWED_TOOLS.includes("write"), false);
+  }
+  assert.throws(() => buildMcpConfig(config, { role: "publisher" }), /Unknown memoryIsolation tool route/);
+});
+
+test("a publisher route requires an explicit configured author label", () => {
+  assert.throws(() => resolveConfig({
+    memoryIsolation: {
+      candidate: { endpoint: "http://127.0.0.1:49327", apiKey: "candidate-key", account: "project-a", user: "candidate" },
+      approved: { endpoint: "http://127.0.0.1:49327", apiKey: "approved-key", account: "project-a", user: "approved" },
+      history: { endpoint: "http://127.0.0.1:49327", apiKey: "history-key", account: "project-a", user: "history" },
+      publisher: { endpoint: "http://127.0.0.1:49327", apiKey: "publisher-key", account: "project-a", user: "publisher-admin" },
+    },
+  }, {}), /approvalAuthorLabel/);
+});

@@ -207,9 +207,15 @@ Common environment variables:
 The profile's `cordis.patch.yml` can also carry plugin config. The optional
 `memoryIsolation` mode is a DSH host input for a **test project**, not a shared
 behavior setting or a replacement for the normal credential chain. It must
-supply all three distinct API keys, HTTP(S) endpoints, account names and user
-names at once; partial input raises an error rather than falling back to legacy
-memory. The candidate connection is resolved through the shared host-input
+supply all three distinct candidate, approved and history API keys, HTTP(S)
+endpoints, account names and user names at once; partial input raises an error
+rather than falling back to legacy memory. A publisher route is optional; when
+present, it must use a fourth distinct key and identity in the approved account,
+and `approvalAuthorLabel` must name the configured label recorded with every
+publication. DSH asks for a one-time human approval before the publisher route
+writes, and that route is never mounted as an MCP tool or sent to the agent. The
+author label is configuration, not a verified identity for the person who
+clicked. The candidate connection is resolved through the shared host-input
 connection path. Keep every key outside the agent's messages and tools, and do
 not put live or publication credentials into a repository. In the synthetic
 fixture, the `config` field of the DSH Cordis patch would contain this
@@ -220,6 +226,8 @@ memoryIsolation:
   candidate: { endpoint: "http://127.0.0.1:<disposable-port>", apiKey: "<synthetic-candidate-key>", account: "man350_project_a", user: "candidate" }
   approved: { endpoint: "http://127.0.0.1:<disposable-port>", apiKey: "<synthetic-approved-key>", account: "man350_project_a", user: "approved" }
   history: { endpoint: "http://127.0.0.1:<disposable-port>", apiKey: "<synthetic-history-key>", account: "man350_project_a", user: "history" }
+  publisher: { endpoint: "http://127.0.0.1:<disposable-port>", apiKey: "<synthetic-publisher-key>", account: "man350_project_a", user: "fixture_admin" }
+  approvalAuthorLabel: "Synthetic reviewer (configured)"
 ```
 
 Do not install this sample in an active DSH profile. The normal host config

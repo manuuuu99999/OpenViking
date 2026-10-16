@@ -8,7 +8,7 @@ import { mountOpenVikingSkills } from "./skills.mjs";
 import { guardVikingUri, noticeVikingUri } from "./uri-guard.mjs";
 
 export const name = "openviking-memory";
-export const inject = ["agents", "sessions", "tools"];
+export const inject = ["agents", "sessions", "tools", "approval"];
 
 export function apply(ctx, input = {}) {
   const config = resolveConfig(input);
@@ -23,6 +23,9 @@ export function apply(ctx, input = {}) {
   const approvedClient = config.memoryIsolation
     ? clientFor(config.memoryIsolation.approved)
     : client;
+  const publisherClient = config.memoryIsolation?.publisher
+    ? clientFor(config.memoryIsolation.publisher)
+    : null;
   const runtime = new OpenVikingRuntime(client, config, ctx.logger, cwd => (
     // Rebuild from the host input, not the config already merged for boot's cwd.
     // The shared loader preserves host/env precedence over workspace peers.
@@ -33,7 +36,13 @@ export function apply(ctx, input = {}) {
   );
   ctx.provide("openvikingMemory", runtime);
   if (config.memoryIsolation) {
-    mountProposalTools(ctx, { runtime, candidateClient: client, approvedClient });
+    mountProposalTools(ctx, {
+      runtime,
+      candidateClient: client,
+      approvedClient,
+      publisherClient,
+      approvalAuthorLabel: config.memoryIsolation.approvalAuthorLabel,
+    });
   }
   ctx.effect(
     () => () => runtime.disposeAll(),

@@ -19,6 +19,69 @@ import {
 } from "./capture.mjs";
 import { deriveDshSessionId } from "./session-id.mjs";
 
+async function recallApprovedResourceBlock(fetchJSON, config, query, { actorPeerId = "", log = () => {} } = {}) {
+  const project = String(config.peerId || "").trim();
+  const approved = config.memoryIsolation?.approved;
+  const publisher = config.memoryIsolation?.publisher;
+  if (
+    !approved?.account
+    || !publisher
+    || !project
+    || project === "."
+    || project === ".."
+    || /[\\/?#]/u.test(project)
+  ) return "";
+
+  const targetUri = `viking://resources/${encodeURIComponent(project)}/approved/memories`;
+  const numericLimit = Number(config.recallLimit);
+  const limit = Number.isFinite(numericLimit) && numericLimit > 0 ? Math.floor(numericLimit) : 10;
+  const numericThreshold = Number(config.scoreThreshold);
+  const scoreThreshold = Number.isFinite(numericThreshold) ? numericThreshold : 0.35;
+  let response;
+  try {
+    response = await fetchJSON("/api/v1/search/find", {
+      method: "POST",
+      body: JSON.stringify({
+        query,
+        target_uri: targetUri,
+        limit,
+        score_threshold: scoreThreshold,
+        read_content: true,
+      }),
+    }, { actorPeerId });
+  } catch {
+    log("approved_resource_recall_failed", { status: 0 });
+    return "";
+  }
+  if (!response?.ok) {
+    log("approved_resource_recall_failed", { status: Number(response?.status) || 0 });
+    return "";
+  }
+
+  const prefix = `${targetUri}/`;
+  const maxChars = Math.max(50, Math.floor(Number(config.recallMaxContentChars) || 500));
+  const entries = (Array.isArray(response.result?.resources) ? response.result.resources : [])
+    .filter(item => typeof item?.uri === "string" && item.uri.startsWith(prefix))
+    .map(item => {
+      const raw = String(item.content || item.abstract || item.overview || "").trim();
+      const withoutApprovalRecord = raw
+        .replace(/^<!-- openviking-approval:v1\n[\s\S]*?\n-->\s*/u, "")
+        .trim();
+      const safeText = (withoutApprovalRecord || raw || item.uri)
+        .replace(/<\/?openviking-context\b[^>]*>/giu, "openviking context marker");
+      return safeText.length > maxChars ? `${safeText.slice(0, maxChars)}...` : safeText;
+    })
+    .filter(Boolean);
+  if (!entries.length) return "";
+
+  return [
+    '<openviking-context source="approved">',
+    "Approved memories for the current project.",
+    ...entries.map(text => `- [approved memory] ${text}`),
+    "</openviking-context>",
+  ].join("\n");
+}
+
 export class OpenVikingRuntime {
   constructor(client, config, logger = console, resolveSessionPeer = null, { approvedClient = client } = {}) {
     this.client = client;
@@ -162,8 +225,10 @@ export class OpenVikingRuntime {
     if (!state.ready || !isRecallEnabled(state.config)) return null;
     const query = promptText(messages);
     if (!query || query.length < state.config.minQueryLength) return null;
+    const fetchJSON = (path, init, options) => this.readClient.fetchJSON(path, init, options);
+    const log = (stage, data) => this.log(stage, data);
     const block = await buildRecallBlock(
-      (path, init, options) => this.readClient.fetchJSON(path, init, options),
+      fetchJSON,
       state.config,
       query,
       {
@@ -171,10 +236,15 @@ export class OpenVikingRuntime {
         legacyPeerId: state.config.legacyPeerId,
         sessionId: state.ovSessionId,
         excludeUris: state.config.recallExcludeUris,
-        log: (stage, data) => this.log(stage, data),
+        log,
       },
     );
-    return block ? pluginMessage(block, { form: "recall" }) : null;
+    const approvedResourceBlock = await recallApprovedResourceBlock(fetchJSON, state.config, query, {
+      actorPeerId: state.config.peerId,
+      log,
+    });
+    const combined = [block, approvedResourceBlock].filter(Boolean).join("\n\n");
+    return combined ? pluginMessage(combined, { form: "recall" }) : null;
   }
 
   capture(session, event) {
