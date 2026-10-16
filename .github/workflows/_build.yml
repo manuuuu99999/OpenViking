@@ -608,6 +608,19 @@ jobs:
         print(f"Bundled Web Studio index {studio_index}")
         PY
 
+    - name: MAN-354 installed-wheel retirement and search (Windows only)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        Set-Location $env:RUNNER_TEMP
+        try {
+          python "$env:GITHUB_WORKSPACE/tests/server/man354_compiled_semantic_probe.py"
+          if ($LASTEXITCODE -ne 0) { throw "MAN-354 probe exited with $LASTEXITCODE" }
+        } finally {
+          Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory -Filter 'man354-wheel-*' |
+            Remove-Item -Recurse -Force -ErrorAction Stop
+        }
+
     - name: Store the distribution packages
       uses: actions/upload-artifact@v7
       with:
