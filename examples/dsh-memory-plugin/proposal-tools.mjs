@@ -109,7 +109,8 @@ async function decideProposal(args, exec, {
   if (!reason) return { proposalId: proposal.id, status: "confirmed_reason_required" };
   if (!exec?.agent) return { proposalId: proposal.id, status: "approval_context_unavailable" };
 
-  const uri = approvedTargetUri(proposal, candidateClient, approvedClient);
+  const targets = approvedMemoryTargets(proposal, candidateClient, approvedClient);
+  const uri = targets?.resourceUri;
   if (!uri) return { proposalId: proposal.id, status: "project_scope_mismatch" };
   const existing = await checkForPublication(store, approvedClient, publisherClient, proposal, uri, exec.signal);
   if (existing) return existing;
@@ -335,7 +336,7 @@ async function openProposal(store, id) {
   return proposal;
 }
 
-function approvedTargetUri(proposal, candidateClient, approvedClient) {
+function approvedMemoryTargets(proposal, candidateClient, approvedClient) {
   const candidateUser = candidateClient?.config?.user;
   const candidateAccount = candidateClient?.config?.account;
   const approvedUser = approvedClient?.config?.user;
@@ -372,7 +373,11 @@ function approvedTargetUri(proposal, candidateClient, approvedClient) {
   if (candidatePath.split("/").some(part => part === "." || part === "..") || /[?#]/u.test(candidatePath)) {
     return null;
   }
-  return `viking://resources/${encodeURIComponent(project)}/approved/${candidatePath}`;
+  const projectPath = encodeURIComponent(project);
+  return {
+    resourceUri: `viking://resources/${projectPath}/approved/${candidatePath}`,
+    peerUri: `viking://user/${approvedUser}/peers/${projectPath}/${candidatePath}`,
+  };
 }
 
 async function readPublication(client, uri, signal) {
@@ -537,27 +542,30 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
     };
   }
 
-  const approvedUri = approvedTargetUri({
+  const targets = approvedMemoryTargets({
     project: segment.projectId,
     source: { candidateUri },
   }, candidateClient, approvedClient);
-  if (!approvedUri) return { ok: false, reason: "project_scope_mismatch" };
-  const approvedResponse = await approvedClient.fetchJSON(
-    `/api/v1/content/read?uri=${encodeURIComponent(approvedUri)}`,
-    {},
-    { signal },
-  );
+  if (!targets) return { ok: false, reason: "project_scope_mismatch" };
   let approvedPrevious = { status: "none", text: "" };
-  if (approvedResponse.ok) {
-    if (typeof approvedResponse.result !== "string") {
-      return {
-        ok: false,
-        reason: "approved_previous_unreadable",
-        failure: await failureDetails("approved_memory", { ...approvedResponse, error: null }),
-      };
+  for (const approvedUri of [targets.resourceUri, targets.peerUri]) {
+    const approvedResponse = await approvedClient.fetchJSON(
+      `/api/v1/content/read?uri=${encodeURIComponent(approvedUri)}`,
+      {},
+      { signal },
+    );
+    if (approvedResponse.ok) {
+      if (typeof approvedResponse.result !== "string") {
+        return {
+          ok: false,
+          reason: "approved_previous_unreadable",
+          failure: await failureDetails("approved_memory", { ...approvedResponse, error: null }),
+        };
+      }
+      approvedPrevious = { status: "found", text: approvedResponse.result };
+      break;
     }
-    approvedPrevious = { status: "found", text: approvedResponse.result };
-  } else if (approvedResponse.status !== 404 && approvedResponse.error?.code !== "NOT_FOUND") {
+    if (approvedResponse.status === 404 || approvedResponse.error?.code === "NOT_FOUND") continue;
     return {
       ok: false,
       reason: "approved_lookup_failed",
