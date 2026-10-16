@@ -1255,7 +1255,7 @@ class FSService:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()
         coordinator = ContentWriteCoordinator(viking_fs=viking_fs, vikingdb=self._vikingdb)
-        return await coordinator.batch_write(
+        result = await coordinator.batch_write(
             root_uri=root_uri,
             operations=operations,
             ctx=ctx,
@@ -1264,6 +1264,16 @@ class FSService:
             skip_conflicts=skip_conflicts,
             processing_mode=processing_mode,
         )
+        # Same follow-ups as ``rm`` for every file the batch removed.
+        for deleted_uri in result.get("deleted", []):
+            await self._sync_watch_after_rm(
+                deleted_uri, account_id=ctx.account_id, context_type="resource"
+            )
+            if self._resource_memory_link_service:
+                await self._resource_memory_link_service.before_resource_delete(
+                    ctx=ctx, resource_uri=deleted_uri, recursive=False
+                )
+        return result
 
     async def set_tags(
         self,

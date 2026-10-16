@@ -302,6 +302,8 @@ class ContentWriteCoordinator:
         normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
         )
+        if skip_conflicts and any(op["mode"] == "delete" for op in normalized_operations):
+            raise InvalidArgumentError("batch-write delete cannot be combined with skip_conflicts")
 
         target_paths = [
             self._viking_fs._uri_to_path(operation["uri"], ctx=ctx)
@@ -318,6 +320,7 @@ class ContentWriteCoordinator:
         created: list[str] = []
         updated: list[str] = []
         unchanged: list[str] = []
+        deleted: list[str] = []
         refresh_kinds: dict[str, str] = {}
         file_md5s: dict[str, str] = {}
         file_abstracts: dict[str, str] = {}
@@ -341,7 +344,13 @@ class ContentWriteCoordinator:
                 # single explicit write: create/replace/upsert all establish
                 # the requested final body, while append only needs the old
                 # body when it already exists.
-                write_mode = "append" if requested_mode == "append" and exists else "replace"
+                write_mode = (
+                    "delete"
+                    if requested_mode == "delete"
+                    else "append"
+                    if requested_mode == "append" and exists
+                    else "replace"
+                )
 
                 if is_abstract_overview_uri(uri):
                     if not exists:
@@ -377,7 +386,7 @@ class ContentWriteCoordinator:
                 pending.append((operation, exists, write_mode))
 
             prepared_resources = await self._prepare_batch_resource_plans(
-                pending=pending,
+                pending=[item for item in pending if item[2] != "delete"],
                 ctx=ctx,
                 lease=lease,
                 processing_mode=processing_mode,
@@ -385,8 +394,9 @@ class ContentWriteCoordinator:
             file_abstracts = await self._load_file_abstracts(
                 [
                     operation["uri"]
-                    for operation, existed, _ in pending
+                    for operation, existed, mode_ in pending
                     if existed
+                    and mode_ != "delete"
                     and context_type_for_uri(operation["uri"]) in {"resource", "skill"}
                     and not is_abstract_overview_uri(operation["uri"])
                     and operation["uri"] not in prepared_resources
@@ -397,6 +407,12 @@ class ContentWriteCoordinator:
             for operation, existed, write_mode in pending:
                 uri = operation["uri"]
                 try:
+                    if write_mode == "delete":
+                        # Same lease as the history copy and the hash check above.
+                        await self._viking_fs.rm(uri, recursive=False, ctx=ctx, lease_ref=lease)
+                        deleted.append(uri)
+                        refresh_kinds[uri] = "deleted"
+                        continue
                     prepared = prepared_resources.get(uri)
                     if prepared is not None:
                         await execute_content_tree_actions(
@@ -637,6 +653,8 @@ class ContentWriteCoordinator:
             "unchanged": unchanged,
             "queue_status": queue_status,
         }
+        if deleted:
+            result["deleted"] = deleted
         if skip_conflicts:
             result["conflicts"] = conflicts
         if refresh_outcome is not None:
@@ -704,6 +722,12 @@ class ContentWriteCoordinator:
                 )
             self._ensure_content_write_policy(uri)
             await self._viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
+
+            if raw.get("mode") == "delete":
+                normalized.append(
+                    await self._normalize_batch_delete(raw, uri, context_type=context_type, ctx=ctx)
+                )
+                continue
 
             has_content = "content" in raw
             has_content_base64 = "content_base64" in raw
@@ -773,7 +797,59 @@ class ContentWriteCoordinator:
                     "ingest_options": ingest_options,
                 }
             )
-        return sorted(normalized, key=lambda operation: operation["uri"])
+        # Unconditioned writes (for example the history copy of the version being replaced
+        # or retired) go first; operations that only hold if the reviewed bytes are still
+        # current, and every delete, go last. A failure part-way therefore leaves history
+        # ahead of the current file, never behind it. URI order breaks ties.
+        return sorted(
+            normalized,
+            key=lambda operation: (
+                operation["mode"] == "delete" or operation["expected_sha256"] is not None,
+                operation["uri"],
+            ),
+        )
+
+    async def _normalize_batch_delete(
+        self,
+        raw: dict[str, Any],
+        uri: str,
+        *,
+        context_type: str,
+        ctx: RequestContext,
+    ) -> dict[str, Any]:
+        """Validate a conditional delete: a resource file, the reviewed hash, nothing else."""
+        if context_type != "resource":
+            raise InvalidArgumentError(
+                f"batch-write delete is only supported for resource files, not memories or skills: {uri}"
+            )
+        if is_abstract_overview_uri(uri):
+            raise InvalidArgumentError(
+                f"batch-write delete cannot remove a derived abstract/overview file: {uri}"
+            )
+        if "content" in raw or "content_base64" in raw:
+            raise InvalidArgumentError(f"batch-write delete takes no content: {uri}")
+        if raw.get("acl") is not None or raw.get("tags") is not None:
+            raise InvalidArgumentError(f"batch-write delete takes no acl or tags: {uri}")
+        expected = raw.get("expected_sha256")
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or any(c not in "0123456789abcdef" for c in expected)
+        ):
+            raise InvalidArgumentError(
+                f"batch-write delete requires a lowercase SHA-256 expected_sha256: {uri}"
+            )
+        # The same guard VikingFS.rm applies, run up front so a refusal writes nothing.
+        await self._viking_fs._ensure_access(
+            uri, replace(ctx, bypass_acl=True), action=AclAction.MANAGE
+        )
+        return {
+            "uri": uri,
+            "content": b"",
+            "mode": "delete",
+            "expected_sha256": expected,
+            "ingest_options": IngestOptions(),
+        }
 
     async def _refresh_batch(
         self,
@@ -798,7 +874,7 @@ class ContentWriteCoordinator:
                 memory_groups[parent.uri if parent is not None else uri].append(uri)
                 continue
             refresh_root = await self._resolve_root_uri(uri, ctx=ctx, anchor_to_parent=True)
-            resource_groups[(refresh_root, context_type)][change_type].append(uri)
+            resource_groups[(refresh_root, context_type)].setdefault(change_type, []).append(uri)
 
         semantic_actions = []
         for (refresh_root, context_type), changes in sorted(resource_groups.items()):
@@ -931,7 +1007,7 @@ class ContentWriteCoordinator:
             ),
             changes={
                 change_type: sorted(changes.get(change_type, []))
-                for change_type in ("added", "modified")
+                for change_type in ("added", "modified", "deleted")
                 if changes.get(change_type)
             },
             generation_trigger="content_write",

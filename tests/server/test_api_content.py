@@ -85,6 +85,22 @@ def test_batch_write_request_accepts_write_parity_options():
     assert request.operations[0].acl.acl_mode == "restricted"
 
 
+def test_batch_write_delete_needs_the_reviewed_hash_and_no_content():
+    uri = "viking://resources/demo/a.md"
+    digest = "a" * 64
+
+    operation = BatchWriteOperation(uri=uri, mode="delete", expected_sha256=digest)
+    assert operation.model_dump(exclude_none=True)["mode"] == "delete"
+    assert "content" not in operation.model_dump(exclude_none=True)
+
+    with pytest.raises(ValueError, match="expected_sha256"):
+        BatchWriteOperation(uri=uri, mode="delete")
+    with pytest.raises(ValueError, match="no content"):
+        BatchWriteOperation(uri=uri, mode="delete", content="x", expected_sha256=digest)
+    with pytest.raises(ValueError, match="exactly one"):
+        BatchWriteOperation(uri=uri, mode="replace")
+
+
 async def test_batch_write_forwards_processing_mode_and_operation_metadata(monkeypatch):
     seen = {}
 
