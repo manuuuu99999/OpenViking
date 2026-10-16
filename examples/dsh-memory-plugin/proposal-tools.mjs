@@ -13,6 +13,7 @@ import {
   inspectChange,
   normalizeText,
   parseApprovalRecord,
+  readPublication,
   sha256,
   sourcesOf,
   stripApprovalRecord,
@@ -23,6 +24,7 @@ import {
 const CHANGE_KINDS = ["extend", "replace", "retire"];
 const PROPOSAL_FILE = "review-proposals.json";
 const PROPOSAL_TOOL_PREFIX = "openviking_";
+const targetQueue = new Map();
 const PENDING_FILTER_NOTE = "El filtro busca formatos conocidos de credenciales; no detecta todo texto sensible.";
 const COMMON_NEGATION_PATTERN = /\b(?:no|not|never|neither|nor|none|nobody|nothing|without|cannot|can't|couldn't|didn't|doesn't|don't|isn't|aren't|wasn't|weren't|won't|wouldn't|mustn't|sin|nunca|jamás|tampoco|ningún|ninguna|ninguno|ningunos|ningunas|nadie|nada|ni)\b/iu;
 
@@ -79,7 +81,23 @@ function decisionTool(dependencies) {
     async execute(args, exec) {
       const current = inFlight.get(args.proposalId);
       if (current) return current;
-      const operation = decideProposal(args, exec, dependencies);
+      const operation = (async () => {
+        const proposal = args.action === "approve" ? await dependencies.store.get(args.proposalId) : null;
+        const target = proposal?.change?.targetUri;
+        if (!target) return decideProposal(args, exec, dependencies);
+        const previous = targetQueue.get(target);
+        const run = (async () => {
+          if (previous) await previous;
+          return decideProposal(args, exec, dependencies);
+        })();
+        const settled = run.then(() => {}, () => {});
+        targetQueue.set(target, settled);
+        try {
+          return await run;
+        } finally {
+          if (targetQueue.get(target) === settled) targetQueue.delete(target);
+        }
+      })();
       inFlight.set(args.proposalId, operation);
       try {
         return await operation;
@@ -119,7 +137,7 @@ async function decideProposal(args, exec, {
     return { proposalId: proposal.id, status: "reason_revised_not_published" };
   }
   if (args.action === "discard") {
-    await store.save({ ...proposal, status: "discarded" });
+    await store.save({ ...proposal, status: "discarded", discardedAt: new Date().toISOString() });
     return { proposalId: proposal.id, status: "discarded" };
   }
   if (args.action !== "approve") return { proposalId: proposal.id, status: "invalid_action" };
@@ -236,7 +254,7 @@ async function decideChange(proposal, reason, resuming, exec, {
   if (!aclEnabled) return answer("publication_acl_disabled");
 
   const settle = async state => {
-    if (state.state === "check_failed") return answer("publication_check_failed");
+    if (state.state === "check_failed") return answer("publication_check_failed", { failure: state.failure });
     if (state.state === "history_conflict") return answer("publication_conflict", { historyUri: state.historyUri });
     if (state.state === "base_changed") {
       await store.save({ ...proposal, status: "needs_new_review", pendingReason: "base_version_changed", intent: undefined });
@@ -315,15 +333,11 @@ async function decideChange(proposal, reason, resuming, exec, {
 
 function changeApprovalLines(proposal) {
   const { kind, targetUri, base } = proposal.change;
-  const clip = text => {
-    const value = String(text || "").replace(/\s+/gu, " ").trim();
-    return value.length > 600 ? `${value.slice(0, 600)}...` : value;
-  };
   return [
     `Cambio: ${kind} de ${targetUri} (versión base ${base.version}).`,
-    `Antes: ${clip(proposal.approvedPrevious?.text)}`,
-    `Después: ${kind === "retire" ? "retirada: sale de la lectura normal y la versión íntegra queda en historia" : clip(proposal.proposedText)}`,
-    `Original comprobado: ${clip(proposal.originalPassage)}`,
+    `Antes: ${proposal.approvedPrevious?.text || ""}`,
+    `Después: ${kind === "retire" ? "retirada: sale de la lectura normal y la versión íntegra queda en historia" : proposal.proposedText}`,
+    `Original comprobado: ${proposal.originalPassage || ""}`,
   ].join("\n");
 }
 
@@ -349,6 +363,10 @@ function reviewTool({ runtime, candidateClient, approvedClient, store }) {
         targetUri: {
           type: "string",
           description: "Approved memory (viking://resources/<project>/approved/memories/...) that the change applies to.",
+        },
+        laterFactExplanation: {
+          type: "string",
+          description: "After a discard, explain the later fact using a passage present in the new original conversation.",
         },
       },
       additionalProperties: false,
@@ -487,7 +505,10 @@ async function prepareProposal({ args, signal, runtime, candidateClient, approve
     change?.targetUri || "",
     normalizeText(evidence.candidateAssertion),
   ].join("\n"));
-  const duplicate = await resolveDuplicate({ store, approvedClient, signal, id, contentKey, source, evidence, segment });
+  const duplicate = await resolveDuplicate({
+    store, approvedClient, signal, id, contentKey, source, evidence, segment,
+    laterFactExplanation: args.laterFactExplanation,
+  });
   if (duplicate.result) return duplicate.result;
 
   const proposal = {
@@ -523,9 +544,9 @@ async function prepareProposal({ args, signal, runtime, candidateClient, approve
 
 /**
  * Repeated ideas: a pending twin gathers the new source, an approved twin is not rewritten and a
- * discarded twin comes back only when the new original passage is a different proof.
+ * discarded twin requires a different proof and an explained later fact in its original passage.
  */
-async function resolveDuplicate({ store, approvedClient, signal, id, contentKey, source, evidence, segment }) {
+async function resolveDuplicate({ store, approvedClient, signal, id, contentKey, source, evidence, segment, laterFactExplanation }) {
   const twins = (await store.all()).filter(record => record.contentKey === contentKey && record.id !== id);
 
   for (const twin of twins.filter(record => record.status === "approved" && record.publishedUri)) {
@@ -562,10 +583,31 @@ async function resolveDuplicate({ store, approvedClient, signal, id, contentKey,
   if (discarded.length > 0) {
     const sameProof = discarded.find(record => sourcesOf(record).some(item => item.evidenceKey === source.evidenceKey));
     if (sameProof) return { result: { ...sameProof, reappearance: "blocked_same_evidence" } };
+    const explanation = typeof laterFactExplanation === "string" ? laterFactExplanation.trim() : "";
+    if (
+      !/[.!?。！？]$/u.test(explanation)
+      || !evidence.originalPassage.includes(explanation)
+      || !hasCompleteAssertionBoundaries(evidence.originalPassage, evidence.originalPassage.indexOf(explanation), explanation)
+      || discarded.some(record => record.originalPassage?.includes(explanation))
+      || !Number.isFinite(Date.parse(evidence.originalCreatedAt))
+      || discarded.some(record => !Number.isFinite(Date.parse(record.discardedAt))
+        || Date.parse(evidence.originalCreatedAt) <= Date.parse(record.discardedAt))
+    ) {
+      const question = pendingProposal({
+        ...proposalMetadata(segment),
+        id,
+        status: "question",
+        pendingReason: "later_fact_explanation_required",
+        originalPassage: evidence.originalPassage,
+        question: "Indica qué hecho posterior explica reabrir el descarte y señala el pasaje original que lo contiene.",
+      });
+      await store.save(question);
+      return { result: question };
+    }
     return {
       reopens: {
         proposalId: discarded[0].id,
-        difference: `New evidence: the original passage from ${source.segment} differs from the discarded proposal's proof.`,
+        difference: `Later fact from ${source.segment}: ${explanation}`,
       },
     };
   }
@@ -636,23 +678,6 @@ function approvedMemoryTargets(proposal, candidateClient, approvedClient) {
     resourceUri: `viking://resources/${projectPath}/approved/${candidatePath}`,
     peerUri: `viking://user/${approvedUser}/peers/${projectPath}/${candidatePath}`,
   };
-}
-
-async function readPublication(client, uri, signal) {
-  try {
-    const response = await client.fetchJSON(
-      `/api/v1/content/read?uri=${encodeURIComponent(uri)}`,
-      {},
-      { signal },
-    );
-    if (response.ok && typeof response.result === "string") {
-      return { ok: true, exists: true, content: response.result };
-    }
-    if (!response.ok && response.status === 404) return { ok: true, exists: false };
-    return { ok: false, exists: false };
-  } catch {
-    return { ok: false, exists: false };
-  }
 }
 
 async function checkForPublication(store, approvedClient, publisherClient, proposal, uri, signal) {
@@ -773,7 +798,8 @@ async function readEvidence(segment, candidateClient, approvedClient, signal, ch
     };
   }
 
-  const originalPassage = findOriginalPassage(archive.value, candidateAssertion, segment.eventCoverage);
+  const originalEvidence = findOriginalPassage(archive.value, candidateAssertion, segment.eventCoverage);
+  const originalPassage = originalEvidence?.text;
   if (!originalPassage) {
     const filterProblem = await hasKnownSecret(candidateText);
     return {
@@ -841,7 +867,10 @@ async function readEvidence(segment, candidateClient, approvedClient, signal, ch
       question: "Esta afirmación ya está aprobada sin cambios. ¿Quieres cerrar la revisión sin preparar otra alta?",
     };
   }
-  return { ok: true, candidateUri, candidateText, candidateAssertion, originalPassage, approvedPrevious };
+  return {
+    ok: true, candidateUri, candidateText, candidateAssertion, originalPassage, approvedPrevious,
+    originalCreatedAt: originalEvidence.createdAt,
+  };
 }
 
 /** Compare the verified candidate with the one approved memory the human named as the target. */
@@ -987,14 +1016,14 @@ function findOriginalPassage(archive, candidateText, eventCoverage = []) {
     .filter(hash => typeof hash === "string" && /^[a-f0-9]{64}$/u.test(hash)));
   if (sourceHashes.size === 0) return "";
 
-  for (const text of extractArchiveTexts(archive)) {
+  for (const { text, createdAt } of extractArchiveTexts(archive)) {
     if (!sourceHashes.has(createHash("sha256").update(text).digest("hex"))) continue;
     let matchIndex = text.indexOf(candidateText);
     while (matchIndex >= 0) {
       if (
         hasCompleteAssertionBoundaries(text, matchIndex, candidateText)
         && !hasNegationOutsideCandidate(text, matchIndex, candidateText)
-      ) return text;
+      ) return { text, createdAt };
       matchIndex = text.indexOf(candidateText, matchIndex + 1);
     }
   }
@@ -1033,7 +1062,7 @@ function extractArchiveTexts(archive) {
     try {
       const message = JSON.parse(line);
       const text = extractTextFromContent(message?.parts ?? message?.content ?? "");
-      if (text) values.push(text);
+      if (text) values.push({ text, createdAt: message.created_at });
     } catch {
       // Malformed archive rows cannot establish which DSH event they came from.
     }

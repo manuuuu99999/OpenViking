@@ -34,6 +34,10 @@ export function createFakeOpenViking({ account = "project-a" } = {}) {
           return respond(true, 200, { result: { settings: { acl: { enabled: state.aclEnabled } } } });
         }
         if (method === "GET" && request.pathname === "/api/v1/content/read") {
+          const failure = matchFailure(user, "GET", uri);
+          if (failure?.aborted) return { ok: false, status: 0, error: { name: "AbortError", aborted: true } };
+          if (failure?.network) return { ok: false, status: 0, error: { message: "network unreachable" } };
+          if (failure) return respond(false, failure.status || 500, { code: failure.code || "INTERNAL" });
           if (candidateFiles.has(uri) && user === "candidate") return respond(true, 200, { result: candidateFiles.get(uri) });
           if (!canRead(uri)) return respond(false, 403, { code: "PERMISSION_DENIED" });
           if (!resources.has(uri)) return respond(false, 404, { code: "NOT_FOUND" });

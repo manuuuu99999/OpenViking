@@ -164,15 +164,29 @@ export function buildChangeIntent(proposal, { reason, authorLabel, approvedAt, a
   };
 }
 
-async function readText(client, uri, signal) {
+export async function readPublication(client, uri, signal, source = "approved_memory") {
   try {
     const response = await client.fetchJSON(`/api/v1/content/read?uri=${encodeURIComponent(uri)}`, {}, { signal });
     if (response.ok && typeof response.result === "string") return { ok: true, exists: true, content: response.result };
     if (!response.ok && response.status === 404) return { ok: true, exists: false };
-  } catch {
-    // Treated as an unreadable state below.
+    return {
+      ok: false,
+      exists: false,
+      failure: {
+        source,
+        status: response.status || 0,
+        code: response.error?.code || (response.error?.aborted
+          ? "TIMEOUT"
+          : response.status === 0 ? "NETWORK_ERROR" : response.ok ? "INVALID_RESPONSE" : "REQUEST_FAILED"),
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      exists: false,
+      failure: { source, status: 0, code: error?.name === "AbortError" ? "TIMEOUT" : "NETWORK_ERROR" },
+    };
   }
-  return { ok: false, exists: false };
 }
 
 /**
@@ -181,10 +195,10 @@ async function readText(client, uri, signal) {
  */
 export async function inspectChange({ approvedClient, historyClient, proposal, signal }) {
   const { kind, targetUri, base } = proposal.change;
-  const current = await readText(approvedClient, targetUri, signal);
+  const current = await readPublication(approvedClient, targetUri, signal);
   const historyUri = historyUriFor(targetUri, base.version, proposal.id);
-  const history = await readText(historyClient, historyUri, signal);
-  if (!current.ok || !history.ok) return { state: "check_failed" };
+  const history = await readPublication(historyClient, historyUri, signal, "history_memory");
+  if (!current.ok || !history.ok) return { state: "check_failed", failure: current.failure || history.failure };
 
   const historyRecord = history.exists ? parseHistoryRecord(history.content) : null;
   const historyIsOurs = historyRecord?.decision?.proposalId === proposal.id;

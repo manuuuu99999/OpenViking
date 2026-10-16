@@ -306,6 +306,16 @@ direct calls to any unlisted tool, including `write` and `remember`. No
 candidate or publication bridge is mounted. A historical tool result also
 adds a warning that its contents are not current approved knowledge.
 
+For a discarded proposal, a different original passage alone does not reopen it.
+`openviking_review_proposal` requires `laterFactExplanation` as a complete
+sentence present in the new original passage and absent from the discarded one;
+the archived message must also be dated after the discard. Otherwise it returns
+a question rather than a reviewable proposal. The archive date establishes order,
+not the independent truth or causal significance of the claimed fact. Change confirmations
+show the complete original, previous and proposed text. Simultaneous decisions
+for one approved target are serialized across mounts in one DSH process;
+separate processes still require server-side conditional writes for the same guarantee.
+
 Outside isolation, `mcp__openviking__forget` performs permanent deletion. The
 calling model should use it only when the user explicitly requests deletion.
 

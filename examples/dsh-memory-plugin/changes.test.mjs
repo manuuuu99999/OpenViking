@@ -77,7 +77,7 @@ async function createWorld() {
       const diffUri = `viking://~/sessions/session-${counter}/memory_diff.json`;
       const candidateUri = `viking://user/candidate/peers/${PROJECT}/memories/entities/${name}.md`;
       const candidateText = ["# Summary", sentence, "", "# ChatLog", `User: ${quote}`].join("\n");
-      server.candidateFiles.set(`${archiveUri}/messages.jsonl`, `${JSON.stringify({ parts: [{ type: "text", text: quote }] })}\n`);
+      server.candidateFiles.set(`${archiveUri}/messages.jsonl`, `${JSON.stringify({ parts: [{ type: "text", text: quote }], created_at: new Date(Date.now() + counter * 1000).toISOString() })}\n`);
       server.candidateFiles.set(diffUri, JSON.stringify({ operations: { adds: [{ uri: candidateUri }], updates: [], deletes: [] } }));
       server.candidateFiles.set(candidateUri, candidateText);
       segments.push({
@@ -358,11 +358,27 @@ test("pending duplicates gather sources, an approved repeat is not rewritten and
   assert.equal(sameProof.status, "discarded", "the same proof does not come back");
   assert.equal(sameProof.reappearance, "blocked_same_evidence");
 
-  const newer = world.addConversation(EXTRA_FACT, { name: "discarded-new-proof", quote: `Later, with a new reason: ${EXTRA_FACT}` });
-  const reproposed = await world.prepare(newer);
+  const laterFact = "The signed note became mandatory on Friday.";
+  const newer = world.addConversation(EXTRA_FACT, { name: "discarded-new-proof", quote: `${EXTRA_FACT} ${laterFact}` });
+  const unsupported = await world.prepare(newer);
+  assert.equal(unsupported.status, "question", "different wording alone cannot reopen a discard");
+  assert.equal(unsupported.pendingReason, "later_fact_explanation_required");
+  const recycled = await world.prepare(newer, { laterFactExplanation: EXTRA_FACT });
+  assert.equal(recycled.status, "question", "the previous assertion is not a later explanation");
+  const preface = await world.prepare(newer, { laterFactExplanation: "The signed note became mandatory" });
+  assert.equal(preface.status, "question", "an incomplete fragment is not an explained fact");
+  const archiveFile = `viking://~/sessions/${newer.segmentId.split(":")[0]}/archive/messages.jsonl`;
+  const recentArchive = world.server.candidateFiles.get(archiveFile);
+  world.server.candidateFiles.set(archiveFile, JSON.stringify({
+    ...JSON.parse(recentArchive), created_at: "2020-01-01T00:00:00.000Z",
+  }));
+  const tooOld = await world.prepare(newer, { laterFactExplanation: laterFact });
+  assert.equal(tooOld.status, "question", "the supposed later fact must actually follow the discard");
+  world.server.candidateFiles.set(archiveFile, recentArchive);
+  const reproposed = await world.prepare(newer, { laterFactExplanation: laterFact });
   assert.equal(reproposed.status, "reviewable");
   assert.equal(reproposed.reopens.proposalId, discardable.id);
-  assert.match(reproposed.reopens.difference, /new evidence/iu);
+  assert.match(reproposed.reopens.difference, /The signed note became mandatory on Friday/u);
 }));
 
 test("an interrupted publication never shows mixed versions, keeps the previous one and recovers on retry", () => withWorld(async world => {
@@ -429,6 +445,61 @@ test("an interrupted retirement keeps the memory current until the retry complet
   assert.equal(world.approvedText(uri), undefined);
   assert.equal(historyEntries(world).length, 1);
   assert.equal((await world.decide(proposal.id, "approve")).status, "already_published");
+}));
+
+test("human confirmation shows full original, before and after for a long change", () => withWorld(async world => {
+  const oldFact = `Invented rule: ${"old-".repeat(170)} ends today.`;
+  const newFact = `Invented rule: ${"new-".repeat(170)} starts tomorrow.`;
+  const base = world.addConversation(oldFact, { name: "long-rule" });
+  const { uri } = await world.approveAlta(base);
+  const later = world.addConversation(newFact, { name: "long-replacement" });
+  const proposal = await world.prepare(later, { changeKind: "replace", targetUri: uri });
+  assert.equal(proposal.status, "reviewable");
+  const decision = await world.decide(proposal.id, "approve", "A later change was verified.");
+  assert.equal(decision.status, "published");
+  const confirmation = world.approvals.at(-1).reason;
+  assert.ok(confirmation.includes(oldFact), "full prior text appears");
+  assert.ok(confirmation.includes(newFact), "full original and proposed text appear");
+  assert.ok(confirmation.includes("Motivo confirmado: A later change was verified."));
+}));
+
+test("a failed version check reports whether authorization or the server prevented publication", () => withWorld(async world => {
+  const base = world.addConversation(BASE_FACT, { name: "shipping" });
+  const { uri } = await world.approveAlta(base);
+  const later = world.addConversation(EXTRA_FACT, { name: "shipping-extra" });
+  const proposal = await world.prepare(later, { changeKind: "extend", targetUri: uri });
+  world.server.failNext({ method: "GET", uriIncludes: "/approved/", status: 403, code: "PERMISSION_DENIED" });
+  const forbidden = await world.decide(proposal.id, "approve", "Keep the new fact.");
+  assert.equal(forbidden.status, "publication_check_failed");
+  assert.deepEqual(forbidden.failure, { source: "approved_memory", status: 403, code: "PERMISSION_DENIED" });
+  world.server.failNext({ method: "GET", uriIncludes: "/history/", status: 503, code: "UNAVAILABLE" });
+  const unavailable = await world.decide(proposal.id, "approve", "Keep the new fact.");
+  assert.deepEqual(unavailable.failure, { source: "history_memory", status: 503, code: "UNAVAILABLE" });
+  world.server.failNext({ method: "GET", uriIncludes: "/history/", aborted: true });
+  const timedOut = await world.decide(proposal.id, "approve", "Keep the new fact.");
+  assert.deepEqual(timedOut.failure, { source: "history_memory", status: 0, code: "TIMEOUT" });
+  world.server.failNext({ method: "GET", uriIncludes: "/approved/", network: true });
+  const offline = await world.decide(proposal.id, "approve", "Keep the new fact.");
+  assert.deepEqual(offline.failure, { source: "approved_memory", status: 0, code: "NETWORK_ERROR" });
+  assert.equal(world.approvedText(uri).includes(EXTRA_FACT), false);
+}));
+
+test("two simultaneous approvals against the same base cannot silently overwrite one another", () => withWorld(async world => {
+  const base = world.addConversation(BASE_FACT, { name: "shipping" });
+  const { uri } = await world.approveAlta(base);
+  const first = world.addConversation(EXTRA_FACT, { name: "first-change" });
+  const second = world.addConversation(NEW_FACT, { name: "second-change" });
+  const firstProposal = await world.prepare(first, { changeKind: "replace", targetUri: uri });
+  const secondProposal = await world.prepare(second, { changeKind: "replace", targetUri: uri });
+  const results = await Promise.all([
+    world.decide(firstProposal.id, "approve", "First proposal."),
+    world.decide(secondProposal.id, "approve", "Second proposal."),
+  ]);
+  assert.equal(results.filter(result => result.status === "published").length, 1);
+  assert.equal(results.filter(result => result.status === "base_version_changed").length, 1);
+  assert.equal(historyEntries(world).length, 1);
+  const current = world.approvedText(uri);
+  assert.equal(current.includes(EXTRA_FACT) && current.includes(NEW_FACT), false);
 }));
 
 test("changes need the history route and never read approved content through the publisher", () => withWorld(async world => {
