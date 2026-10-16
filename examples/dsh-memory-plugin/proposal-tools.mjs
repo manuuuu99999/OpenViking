@@ -5,7 +5,22 @@ import { dirname, join } from "node:path";
 import { extractTextFromContent } from "./shared/capture-utils.mjs";
 import { stateDir } from "./shared/workspace-identity.mjs";
 import { parseMemoryDiff } from "./runtime.mjs";
+import {
+  applyChange,
+  buildChangeIntent,
+  composeExtension,
+  contentWithApprovalRecord,
+  inspectChange,
+  normalizeText,
+  parseApprovalRecord,
+  sha256,
+  sourcesOf,
+  stripApprovalRecord,
+  validateChangeTarget,
+  versionOf,
+} from "./approved-versions.mjs";
 
+const CHANGE_KINDS = ["extend", "replace", "retire"];
 const PROPOSAL_FILE = "review-proposals.json";
 const PROPOSAL_TOOL_PREFIX = "openviking_";
 const PENDING_FILTER_NOTE = "El filtro busca formatos conocidos de credenciales; no detecta todo texto sensible.";
@@ -17,6 +32,7 @@ export function mountProposalTools(ctx, {
   candidateClient,
   approvedClient,
   publisherClient,
+  historyClient,
   approvalAuthorLabel,
 }) {
   if (!runtime || !candidateClient || !approvedClient) {
@@ -32,6 +48,7 @@ export function mountProposalTools(ctx, {
       candidateClient,
       approvedClient,
       publisherClient,
+      historyClient,
       approvalAuthorLabel,
     }));
   }
@@ -79,6 +96,7 @@ async function decideProposal(args, exec, {
   publisherClient,
   approvedClient,
   candidateClient,
+  historyClient,
   approvalAuthorLabel,
 }) {
   const proposal = await store.get(args.proposalId);
@@ -86,7 +104,9 @@ async function decideProposal(args, exec, {
   if (proposal.status === "approved") {
     return { proposalId: proposal.id, status: "already_published", uri: proposal.publishedUri };
   }
-  if (proposal.status !== "reviewable") {
+  // A change whose confirmed decision was interrupted is finished, not asked about again.
+  const resuming = proposal.status === "publishing" && proposal.change && proposal.intent && args.action === "approve";
+  if (proposal.status !== "reviewable" && !resuming) {
     return { proposalId: proposal.id, status: proposal.status || "proposal_not_reviewable" };
   }
   if (args.action === "defer") {
@@ -103,11 +123,23 @@ async function decideProposal(args, exec, {
     return { proposalId: proposal.id, status: "discarded" };
   }
   if (args.action !== "approve") return { proposalId: proposal.id, status: "invalid_action" };
-  const reason = typeof args.reason === "string" && args.reason.trim()
-    ? args.reason.trim()
-    : String(proposal.reasonDraft || "").trim();
+  const reason = resuming
+    ? proposal.intent.approvalRecord.reason
+    : typeof args.reason === "string" && args.reason.trim()
+      ? args.reason.trim()
+      : String(proposal.reasonDraft || "").trim();
   if (!reason) return { proposalId: proposal.id, status: "confirmed_reason_required" };
-  if (!exec?.agent) return { proposalId: proposal.id, status: "approval_context_unavailable" };
+  if (!exec?.agent && !resuming) return { proposalId: proposal.id, status: "approval_context_unavailable" };
+  if (proposal.change) {
+    return decideChange(proposal, reason, resuming, exec, {
+      store,
+      approval,
+      publisherClient,
+      approvedClient,
+      historyClient,
+      approvalAuthorLabel,
+    });
+  }
 
   const targets = approvedMemoryTargets(proposal, candidateClient, approvedClient);
   const uri = targets?.resourceUri;
@@ -148,6 +180,7 @@ async function decideProposal(args, exec, {
       segment: proposal.segment,
       eventIds: proposal.coverage?.eventIds || [],
     },
+    sources: sourcesOf(proposal),
     reason,
   };
   const content = contentWithApprovalRecord(proposal.proposedText, approvalRecord);
@@ -180,6 +213,120 @@ async function decideProposal(args, exec, {
   return { proposalId: proposal.id, status: "published", uri, approvedAt: approvalRecord.approvedAt };
 }
 
+/**
+ * Approve an extension, substitution or retirement of an approved memory. The whole previous
+ * version goes to history first, then the current memory is replaced (or removed) in one step.
+ * The confirmed decision is stored before anything is written, so an interrupted publication
+ * is finished from that record instead of being asked about again.
+ */
+async function decideChange(proposal, reason, resuming, exec, {
+  store,
+  approval,
+  publisherClient,
+  approvedClient,
+  historyClient,
+  approvalAuthorLabel,
+}) {
+  const answer = (status, extra = {}) => ({ proposalId: proposal.id, decisionId: proposal.id, status, ...extra });
+  if (!historyClient) return answer("history_unavailable");
+  const targetUri = validateChangeTarget(proposal.project, proposal.change.targetUri);
+  if (!targetUri) return answer("project_scope_mismatch");
+  const aclEnabled = await resourceAclEnabled(publisherClient, exec?.signal);
+  if (aclEnabled === null) return answer("publication_check_failed");
+  if (!aclEnabled) return answer("publication_acl_disabled");
+
+  const settle = async state => {
+    if (state.state === "check_failed") return answer("publication_check_failed");
+    if (state.state === "history_conflict") return answer("publication_conflict", { historyUri: state.historyUri });
+    if (state.state === "base_changed") {
+      await store.save({ ...proposal, status: "needs_new_review", pendingReason: "base_version_changed", intent: undefined });
+      return answer("base_version_changed", { uri: targetUri });
+    }
+    if (state.state === "completed") {
+      await store.save({
+        ...proposal,
+        status: "approved",
+        publishedUri: proposal.change.kind === "retire" ? "" : targetUri,
+        historyUri: state.historyUri,
+        approvalRecord: state.record || proposal.intent?.approvalRecord,
+        intent: undefined,
+      });
+      return answer("already_published", { uri: targetUri, historyUri: state.historyUri });
+    }
+    return null;
+  };
+  const inspect = () => inspectChange({ approvedClient, historyClient, proposal, signal: exec?.signal });
+
+  let state = await inspect();
+  const finished = await settle(state);
+  if (finished) return finished;
+
+  let intent = resuming ? proposal.intent : null;
+  if (!intent) {
+    let outcome;
+    try {
+      outcome = await approval.request({
+        agent: exec.agent,
+        toolName: "openviking_decide_proposal",
+        callId: exec.callId,
+        signal: exec.signal,
+        reason: `${approvalReason(proposal, reason, approvalAuthorLabel)}\n${changeApprovalLines(proposal)}`,
+      });
+    } catch {
+      return answer("approval_unavailable");
+    }
+    if (outcome !== "allowed-once") return answer(`approval_${outcome.replaceAll("-", "_")}`);
+    state = await inspect();
+    const changedWhileAsking = await settle(state);
+    if (changedWhileAsking) return changedWhileAsking;
+    intent = buildChangeIntent(proposal, {
+      reason,
+      authorLabel: approvalAuthorLabel,
+      approvedAt: new Date().toISOString(),
+      approvedUser: approvedClient.config.user,
+    });
+    await store.save({ ...proposal, status: "publishing", intent });
+  }
+
+  const applied = await applyChange({
+    publisherClient,
+    historyUser: historyClient.config.user,
+    intent,
+    historyExists: state.historyExists,
+    signal: exec?.signal,
+  });
+  if (!applied.ok) return answer("publication_failed", { recoverable: true, stage: applied.stage });
+  await store.save({
+    ...proposal,
+    status: "approved",
+    publishedUri: intent.kind === "retire" ? "" : intent.targetUri,
+    historyUri: intent.historyUri,
+    approvalRecord: intent.approvalRecord,
+    intent: undefined,
+  });
+  return answer("published", {
+    kind: intent.kind,
+    ...(intent.kind === "retire" ? { retiredUri: intent.targetUri } : { uri: intent.targetUri }),
+    historyUri: intent.historyUri,
+    version: intent.approvalRecord.change.version,
+    approvedAt: intent.approvalRecord.approvedAt,
+  });
+}
+
+function changeApprovalLines(proposal) {
+  const { kind, targetUri, base } = proposal.change;
+  const clip = text => {
+    const value = String(text || "").replace(/\s+/gu, " ").trim();
+    return value.length > 600 ? `${value.slice(0, 600)}...` : value;
+  };
+  return [
+    `Cambio: ${kind} de ${targetUri} (versión base ${base.version}).`,
+    `Antes: ${clip(proposal.approvedPrevious?.text)}`,
+    `Después: ${kind === "retire" ? "retirada: sale de la lectura normal y la versión íntegra queda en historia" : clip(proposal.proposedText)}`,
+    `Original comprobado: ${clip(proposal.originalPassage)}`,
+  ].join("\n");
+}
+
 function reviewTool({ runtime, candidateClient, approvedClient, store }) {
   return {
     name: `${PROPOSAL_TOOL_PREFIX}review_proposal`,
@@ -193,6 +340,15 @@ function reviewTool({ runtime, candidateClient, approvedClient, store }) {
           type: "array",
           items: { type: "string" },
           description: "Optional requested project scope. An unverified scope remains a question, not a generalization.",
+        },
+        changeKind: {
+          type: "string",
+          enum: CHANGE_KINDS,
+          description: "With segmentId and targetUri, prepare an extension, substitution or retirement of an already approved memory instead of a new one. Never inferred.",
+        },
+        targetUri: {
+          type: "string",
+          description: "Approved memory (viking://resources/<project>/approved/memories/...) that the change applies to.",
         },
       },
       additionalProperties: false,
@@ -244,6 +400,25 @@ async function prepareProposal({ args, signal, runtime, candidateClient, approve
     });
   }
 
+  let change = null;
+  if (args.changeKind !== undefined || args.targetUri !== undefined) {
+    const label = `${args.changeKind || ""}:${args.targetUri || ""}`;
+    const pendingChange = async reason => {
+      const pending = pendingProposal({
+        ...proposalMetadata(segment),
+        id: proposalId(segment.projectId, segment.segmentId, "", label),
+        status: "pending",
+        pendingReason: reason,
+      });
+      await store.save(pending);
+      return pending;
+    };
+    if (!CHANGE_KINDS.includes(args.changeKind) || !args.targetUri) return pendingChange("change_target_required");
+    const targetUri = validateChangeTarget(String(segment.projectId || ""), args.targetUri);
+    if (!targetUri) return pendingChange("change_target_invalid");
+    change = { kind: args.changeKind, targetUri };
+  }
+
   const targetProjects = Array.isArray(args.targetProjects) && args.targetProjects.length > 0
     ? [...new Set(args.targetProjects.map(value => String(value).trim()).filter(Boolean))]
     : [String(segment.projectId || "")];
@@ -271,11 +446,11 @@ async function prepareProposal({ args, signal, runtime, candidateClient, approve
     return pending;
   }
 
-  const evidence = await readEvidence(segment, candidateClient, approvedClient, signal);
+  const evidence = await readEvidence(segment, candidateClient, approvedClient, signal, change);
   if (!evidence.ok) {
     const pending = pendingProposal({
       ...proposalMetadata(segment),
-      id: proposalId(segment.projectId, segment.segmentId),
+      id: proposalId(segment.projectId, segment.segmentId, "", change ? `${change.kind}:${change.targetUri}` : ""),
       status: evidence.status === "question" ? "question" : "pending",
       pendingReason: evidence.reason,
       ...(evidence.safeAssertion ? { assertion: evidence.safeAssertion } : {}),
@@ -288,30 +463,113 @@ async function prepareProposal({ args, signal, runtime, candidateClient, approve
     return pending;
   }
 
-  const id = proposalId(segment.projectId, segment.segmentId, evidence.candidateUri);
+  const kind = change ? change.kind : "add";
+  const id = proposalId(
+    segment.projectId,
+    segment.segmentId,
+    evidence.candidateUri,
+    change ? `${change.kind}:${change.targetUri}` : "",
+  );
   const previous = await store.get(id);
-  if (previous?.status === "approved" || previous?.status === "discarded") return previous;
+  if (["approved", "discarded", "publishing"].includes(previous?.status)) return previous;
+
+  const source = {
+    session: String(segment.dshSessionId || ""),
+    segment: String(segment.segmentId || ""),
+    archiveUri: segment.archive.uri,
+    candidateUri: evidence.candidateUri,
+    eventIds: summarizeCoverage(segment).eventIds,
+    evidenceKey: sha256(evidence.originalPassage),
+  };
+  const contentKey = sha256([
+    segment.projectId,
+    kind,
+    change?.targetUri || "",
+    normalizeText(evidence.candidateAssertion),
+  ].join("\n"));
+  const duplicate = await resolveDuplicate({ store, approvedClient, signal, id, contentKey, source, evidence, segment });
+  if (duplicate.result) return duplicate.result;
+
   const proposal = {
     ...proposalMetadata(segment),
     id,
     status: "reviewable",
+    contentKey,
     assertion: evidence.candidateAssertion,
     originalPassage: evidence.originalPassage,
     coverage: summarizeCoverage(segment),
     approvedPrevious: evidence.approvedPrevious,
-    proposedText: evidence.candidateText,
+    proposedText: evidence.proposedText ?? evidence.candidateText,
     source: {
       archiveUri: segment.archive.uri,
       candidateUri: evidence.candidateUri,
     },
+    sources: previous?.status === "reviewable" && Array.isArray(previous.sources)
+      ? [...previous.sources.filter(item => item.segment !== source.segment), source]
+      : [source],
+    ...(change ? { change: evidence.change } : {}),
+    ...(duplicate.reopens ? { reopens: duplicate.reopens } : {}),
     ...(previous?.reasonDraft ? { reasonDraft: previous.reasonDraft } : {}),
     reasonSuggested: previous?.reasonDraft || "La afirmación aparece en el pasaje original comprobado de una conversación nueva; Sergi debe decidir si quiere conservarla como conocimiento vigente.",
-    effect: `Si se aprueba en un flujo futuro, el texto podría entrar en la búsqueda ordinaria de ${segment.projectId}; esta propuesta no publica ni modifica el aprobado.`,
+    effect: change
+      ? `Si Sergi aprueba esta ${change.kind === "extend" ? "ampliación" : change.kind === "replace" ? "sustitución" : "retirada"}, ${change.kind === "retire" ? "el recuerdo saldrá de la búsqueda ordinaria" : "la búsqueda ordinaria leerá la versión nueva completa"} de ${segment.projectId} y la versión anterior íntegra quedará en historia. Hasta entonces no cambia nada.`
+      : `Si se aprueba en un flujo futuro, el texto podría entrar en la búsqueda ordinaria de ${segment.projectId}; esta propuesta no publica ni modifica el aprobado.`,
     filterNote: "Se comprobaron formatos conocidos de credenciales. Esto no detecta todo texto sensible.",
     pendingReason: "",
   };
   await store.save(proposal);
   return proposal;
+}
+
+/**
+ * Repeated ideas: a pending twin gathers the new source, an approved twin is not rewritten and a
+ * discarded twin comes back only when the new original passage is a different proof.
+ */
+async function resolveDuplicate({ store, approvedClient, signal, id, contentKey, source, evidence, segment }) {
+  const twins = (await store.all()).filter(record => record.contentKey === contentKey && record.id !== id);
+
+  for (const twin of twins.filter(record => record.status === "approved" && record.publishedUri)) {
+    const current = await readPublication(approvedClient, twin.publishedUri, signal);
+    if (current.exists && parseApprovalRecord(current.content)?.proposalId === twin.id) {
+      const question = pendingProposal({
+        ...proposalMetadata(segment),
+        id,
+        status: "question",
+        pendingReason: "already_approved_no_change",
+        assertion: evidence.candidateAssertion,
+        originalPassage: evidence.originalPassage,
+        approvedPrevious: { status: "found", text: stripApprovalRecord(current.content) },
+        question: "Esta afirmación ya está aprobada sin cambios. ¿Quieres cerrar la revisión sin preparar otra alta?",
+        duplicateOf: twin.id,
+      });
+      await store.save(question);
+      return { result: question };
+    }
+  }
+
+  const pending = twins.find(record => record.status === "reviewable");
+  if (pending) {
+    const known = sourcesOf(pending);
+    if (known.some(item => item.evidenceKey === source.evidenceKey && item.segment === source.segment)) {
+      return { result: pending };
+    }
+    const merged = { ...pending, sources: [...known, source] };
+    await store.save(merged);
+    return { result: merged };
+  }
+
+  const discarded = twins.filter(record => record.status === "discarded");
+  if (discarded.length > 0) {
+    const sameProof = discarded.find(record => sourcesOf(record).some(item => item.evidenceKey === source.evidenceKey));
+    if (sameProof) return { result: { ...sameProof, reappearance: "blocked_same_evidence" } };
+    return {
+      reopens: {
+        proposalId: discarded[0].id,
+        difference: `New evidence: the original passage from ${source.segment} differs from the discarded proposal's proof.`,
+      },
+    };
+  }
+  return {};
 }
 
 async function openProposal(store, id) {
@@ -431,23 +689,6 @@ async function resourceAclEnabled(client, signal) {
   }
 }
 
-function parseApprovalRecord(content) {
-  const start = "<!-- openviking-approval:v1\n";
-  if (typeof content !== "string" || !content.startsWith(start)) return null;
-  const end = content.indexOf("\n-->", start.length);
-  if (end < 0) return null;
-  try {
-    const record = JSON.parse(content.slice(start.length, end));
-    return record?.schema === "openviking.dsh.approval.v1" ? record : null;
-  } catch {
-    return null;
-  }
-}
-
-function contentWithApprovalRecord(proposedText, record) {
-  return `<!-- openviking-approval:v1\n${JSON.stringify(record)}\n-->\n\n${proposedText}`;
-}
-
 function approvalReason(proposal, reason, authorLabel) {
   return [
     `Publicar solo la propuesta ${proposal.id}.`,
@@ -497,7 +738,7 @@ function proposalView(result) {
   };
 }
 
-async function readEvidence(segment, candidateClient, approvedClient, signal) {
+async function readEvidence(segment, candidateClient, approvedClient, signal, change = null) {
   const archiveUri = segment.archive?.uri;
   const diffUri = segment.extraction?.memoryDiffUri;
   if (!archiveUri || !diffUri) return { ok: false, reason: "source_or_extraction_reference_missing" };
@@ -547,6 +788,9 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
     source: { candidateUri },
   }, candidateClient, approvedClient);
   if (!targets) return { ok: false, reason: "project_scope_mismatch" };
+  if (change) {
+    return changeEvidence({ change, approvedClient, signal, candidateUri, candidateText, candidateAssertion, originalPassage });
+  }
   let approvedPrevious = { status: "none", text: "" };
   for (const approvedUri of [targets.resourceUri, targets.peerUri]) {
     const approvedResponse = await approvedClient.fetchJSON(
@@ -562,7 +806,7 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
           failure: await failureDetails("approved_memory", { ...approvedResponse, error: null }),
         };
       }
-      approvedPrevious = { status: "found", text: approvedResponse.result };
+      approvedPrevious = { status: "found", text: stripApprovalRecord(approvedResponse.result) };
       break;
     }
     if (approvedResponse.status === 404 || approvedResponse.error?.code === "NOT_FOUND") continue;
@@ -598,6 +842,63 @@ async function readEvidence(segment, candidateClient, approvedClient, signal) {
     };
   }
   return { ok: true, candidateUri, candidateText, candidateAssertion, originalPassage, approvedPrevious };
+}
+
+/** Compare the verified candidate with the one approved memory the human named as the target. */
+async function changeEvidence({
+  change,
+  approvedClient,
+  signal,
+  candidateUri,
+  candidateText,
+  candidateAssertion,
+  originalPassage,
+}) {
+  const target = await readPublication(approvedClient, change.targetUri, signal);
+  if (!target.ok) return { ok: false, reason: "approved_lookup_failed" };
+  if (!target.exists) return { ok: false, reason: "change_target_not_approved" };
+
+  const record = parseApprovalRecord(target.content);
+  const body = stripApprovalRecord(target.content);
+  const filterProblem = await hasKnownSecret(candidateText, originalPassage, target.content);
+  if (filterProblem) return { ok: false, reason: filterProblem };
+
+  const noChange = change.kind === "extend"
+    ? normalizeText(body).includes(normalizeText(candidateAssertion))
+    : change.kind === "replace" && normalizeText(body) === normalizeText(candidateText);
+  if (noChange) {
+    return {
+      ok: false,
+      status: "question",
+      reason: "already_approved_no_change",
+      safeAssertion: candidateAssertion,
+      originalPassage,
+      approvedPrevious: { status: "found", text: body },
+      question: "La memoria aprobada ya dice lo mismo. ¿Quieres cerrar la revisión sin preparar el cambio?",
+    };
+  }
+  const proposedText = change.kind === "retire"
+    ? ""
+    : change.kind === "extend" ? composeExtension(body, candidateAssertion) : candidateText;
+  return {
+    ok: true,
+    candidateUri,
+    candidateText,
+    candidateAssertion,
+    originalPassage,
+    proposedText,
+    approvedPrevious: { status: "found", text: body },
+    change: {
+      kind: change.kind,
+      targetUri: change.targetUri,
+      base: {
+        hash: sha256(target.content),
+        version: versionOf(record),
+        proposalId: record?.proposalId || "",
+        content: target.content,
+      },
+    },
+  };
 }
 
 async function readContent(client, uri, signal, source) {
@@ -838,7 +1139,13 @@ function renderProposal(proposal) {
     `**Pasaje original comprobado:** ${proposal.originalPassage || "no disponible"}`,
     `**Cobertura:** ${proposal.coverage?.status || "sin comprobar"}; eventos ${proposal.coverage?.eventIds?.join(", ") || "no disponibles"}`,
     `**Aprobado anterior:** ${proposal.approvedPrevious?.status === "found" ? proposal.approvedPrevious.text : proposal.approvedPrevious?.status || "no comprobado"}`,
-    `**Texto propuesto:** ${proposal.proposedText || "no preparado"}`,
+    ...(proposal.change ? [`**Cambio:** ${proposal.change.kind} sobre ${proposal.change.targetUri} (versión base ${proposal.change.base?.version})`] : []),
+    ...(Array.isArray(proposal.sources) && proposal.sources.length > 1
+      ? [`**Fuentes reunidas:** ${proposal.sources.map(item => `${item.session} / ${item.segment}`).join("; ")}`]
+      : []),
+    ...(proposal.reopens ? [`**Reabre un descarte anterior:** ${proposal.reopens.proposalId} · ${proposal.reopens.difference}`] : []),
+    ...(proposal.reappearance ? [`**No vuelve a proponerse:** misma prueba que un descarte (${proposal.reappearance})`] : []),
+    `**Texto propuesto:** ${proposal.change?.kind === "retire" ? "retirada: sale de la lectura normal y queda en historia" : proposal.proposedText || "no preparado"}`,
     `**Motivo sugerido:** ${proposal.reasonSuggested || "no disponible"}`,
     `**Efecto previsto:** ${proposal.effect || "no comprobado"}`,
     `**Pendiente:** ${proposal.pendingReason || "no"}`,
@@ -859,8 +1166,8 @@ function renderFailure(failure) {
   ].filter(Boolean).join(" · ");
 }
 
-function proposalId(projectId, segmentId, candidateUri = "") {
-  const source = [projectId, segmentId, candidateUri].join("\n");
+function proposalId(projectId, segmentId, candidateUri = "", change = "") {
+  const source = (change ? [projectId, segmentId, candidateUri, change] : [projectId, segmentId, candidateUri]).join("\n");
   return `proposal-${createHash("sha256").update(source).digest("hex").slice(0, 20)}`;
 }
 
@@ -887,6 +1194,11 @@ class ProposalStore {
   async get(id) {
     await this.pending;
     return (await this.readAll()).find(record => record.id === id) || null;
+  }
+
+  async all() {
+    await this.pending;
+    return this.readAll();
   }
 
   async readAll() {

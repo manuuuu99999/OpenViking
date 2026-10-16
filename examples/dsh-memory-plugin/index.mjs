@@ -26,6 +26,9 @@ export function apply(ctx, input = {}) {
   const publisherClient = config.memoryIsolation?.publisher
     ? clientFor(config.memoryIsolation.publisher)
     : null;
+  const historyClient = config.memoryIsolation
+    ? clientFor(config.memoryIsolation.history)
+    : null;
   const runtime = new OpenVikingRuntime(client, config, ctx.logger, cwd => (
     // Rebuild from the host input, not the config already merged for boot's cwd.
     // The shared loader preserves host/env precedence over workspace peers.
@@ -41,6 +44,7 @@ export function apply(ctx, input = {}) {
       candidateClient: client,
       approvedClient,
       publisherClient,
+      historyClient,
       approvalAuthorLabel: config.memoryIsolation.approvalAuthorLabel,
     });
   }

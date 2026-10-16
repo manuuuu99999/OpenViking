@@ -360,6 +360,11 @@ repeatable public-interface regression checks, including Markdown parsing,
 substring rejection, negation, missing evidence, scope, and secret filtering;
 it does not establish that the real server emits that candidate shape. Stop the
 specific server process after the tests and verify its port is closed.
+The MAN-354 check (`MAN354_SYNTHETIC_MANIFEST` and `MAN354_SYNTHETIC_ROOT`,
+same manifest) enables resource ACLs on the disposable account, then extends,
+replaces and retires one approved memory through the public tools, including an
+interrupted publication, a lost server answer and a stale base version, and
+checks that every superseded version stays readable only through history.
 The `run-<id>` directory contains synthetic data and keys; do not commit or
 copy it into an active profile. Regular `npm test` intentionally skips these
 opt-in tests instead of contacting a configured service.
